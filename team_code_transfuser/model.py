@@ -7,8 +7,8 @@ from transfuser import TransfuserBackbone, SegDecoder, DepthDecoder
 from geometric_fusion import GeometricFusionBackbone
 from late_fusion import LateFusionBackbone
 from latentTF import latentTFBackbone
+from lidar_only import LidarOnlyBackbone
 from copy import deepcopy
-from point_pillar import PointPillarNet
 
 
 from PIL import Image, ImageFont, ImageDraw
@@ -552,6 +552,10 @@ class LidarCenterNet(nn.Module):
         self.use_point_pillars = config.use_point_pillars
 
         if(self.use_point_pillars == True):
+            # Imported here, not at module load, so torch_scatter (a
+            # CUDA-extension package pinned to an exact torch/cuda build) is
+            # only required when this optional LiDAR path is actually used.
+            from point_pillar import PointPillarNet
             self.point_pillar_net = PointPillarNet(config.num_input, config.num_features,
                                                    min_x = config.min_x, max_x = config.max_x,
                                                    min_y = config.min_y, max_y = config.max_y,
@@ -569,8 +573,10 @@ class LidarCenterNet(nn.Module):
             self._model = GeometricFusionBackbone(config, image_architecture, lidar_architecture, use_velocity=use_velocity).to(self.device)
         elif (backbone == 'latentTF'):
             self._model = latentTFBackbone(config, image_architecture, lidar_architecture, use_velocity=use_velocity).to(self.device)
+        elif (backbone == 'lidar_only'):
+            self._model = LidarOnlyBackbone(config, image_architecture, lidar_architecture, use_velocity=use_velocity).to(self.device)
         else:
-            raise("The chosen vision backbone does not exist. The options are: transFuser, late_fusion, geometric_fusion, latentTF")
+            raise("The chosen vision backbone does not exist. The options are: transFuser, late_fusion, geometric_fusion, latentTF, lidar_only")
 
         if config.multitask:
             self.seg_decoder   = SegDecoder(self.config,   self.config.perception_output_features).to(self.device)
@@ -645,7 +651,7 @@ class LidarCenterNet(nn.Module):
 
         return pred_wp, pred_brake, steer, throttle, brake
 
-    def control_pid(self, waypoints, velocity, is_stuck):
+    def control_pid(self, waypoints, velocity, is_stuck, pitch=0.0):
         ''' Predicts vehicle control with a PID controller.
         Args:
             waypoints (tensor): output of self.plan()
@@ -656,31 +662,75 @@ class LidarCenterNet(nn.Module):
         # when training we transform the waypoints to lidar coordinate, so we need to change is back when control
         waypoints[:, 0] += self.config.lidar_pos[0]
 
-        speed = velocity[0].data.cpu().numpy()
+        speed = float(velocity[0].data.cpu().numpy())
+        pitch = float(pitch)
 
-        desired_speed = np.linalg.norm(waypoints[0] - waypoints[1]) * 2.0
+        learned_desired_speed = float(
+            np.linalg.norm(waypoints[0] - waypoints[1]) * 2.0
+        )
+        desired_speed = learned_desired_speed
 
         if is_stuck:
-            desired_speed = np.array(self.config.default_speed) # default speed of 14.4 km/h
+            desired_speed = float(self.config.default_speed) # default speed of 14.4 km/h
 
-        brake = ((desired_speed < self.config.brake_speed) or ((speed / desired_speed) > self.config.brake_ratio))
+        target_stop = desired_speed < self.config.brake_speed
+        if target_stop:
+            brake = 1.0 if speed > 0.10 else 0.50
+        else:
+            overspeed = speed - desired_speed
+            speed_brake = np.clip(
+                (overspeed - self.config.service_brake_deadband)
+                * self.config.service_brake_gain,
+                0.0,
+                self.config.max_service_brake,
+            )
+            downhill_hold = 0.0
+            if pitch < 0.0 and speed > desired_speed - 0.30:
+                downhill_hold = min(
+                    self.config.max_downhill_brake,
+                    -np.sin(np.radians(pitch))
+                    * self.config.downhill_brake_gain,
+                )
+            brake = float(max(speed_brake, downhill_hold))
 
         delta = np.clip(desired_speed - speed, 0.0, self.config.clip_delta)
-        throttle = self.speed_controller.step(delta)
-        throttle = np.clip(throttle, 0.0, self.config.clip_throttle)
-        throttle = throttle if not brake else 0.0
+        if brake > 1e-4:
+            throttle = 0.0
+        else:
+            throttle = self.speed_controller.step(delta)
+            uphill_feed_forward = max(
+                0.0,
+                np.sin(np.radians(pitch))
+                * self.config.uphill_feed_forward_gain,
+            )
+            cruise_feed_forward = (
+                self.config.cruise_feed_forward
+                if desired_speed > 0.1 else 0.0
+            )
+            throttle = np.clip(
+                throttle + uphill_feed_forward + cruise_feed_forward,
+                0.0,
+                self.config.clip_throttle,
+            )
         aim = (waypoints[1] + waypoints[0]) / 2.0
         angle = np.degrees(np.arctan2(aim[1], aim[0])) / 90.0
         if (speed < 0.01):
             angle = 0.0  # When we don't move we don't want the angle error to accumulate in the integral
-        if brake:
+        if target_stop:
             angle = 0.0
         
         steer = self.turn_controller.step(angle)
 
         steer = np.clip(steer, -1.0, 1.0) #Valid steering values are in [-1,1]
 
-        return steer, throttle, brake
+        telemetry = {
+            'learned_desired_speed': learned_desired_speed,
+            'desired_speed': desired_speed,
+            'speed_error': desired_speed - speed,
+            'pitch': pitch,
+            'target_stop': bool(target_stop),
+        }
+        return float(steer), float(throttle), float(brake), telemetry
     
     def forward_ego(self, rgb, lidar_bev, target_point, target_point_image, ego_vel, bev_points=None, cam_points=None, save_path=None, expert_waypoints=None,
                     stuck_detector=0, forced_move=False, num_points=None, rgb_back=None, debug=False):
@@ -700,8 +750,10 @@ class LidarCenterNet(nn.Module):
             features, image_features_grid, fused_features = self._model(rgb, lidar_bev, ego_vel, bev_points, cam_points)
         elif (self.backbone == 'latentTF'):
             features, image_features_grid, fused_features = self._model(rgb, lidar_bev, ego_vel)
+        elif (self.backbone == 'lidar_only'):
+            features, image_features_grid, fused_features = self._model(rgb, lidar_bev, ego_vel)
         else:
-            raise ("The chosen vision backbone does not exist. The options are: transFuser, late_fusion, geometric_fusion, latentTF")
+            raise ("The chosen vision backbone does not exist. The options are: transFuser, late_fusion, geometric_fusion, latentTF, lidar_only")
 
         pred_wp, _, _, _, _ = self.forward_gru(fused_features, target_point)
 
@@ -720,8 +772,8 @@ class LidarCenterNet(nn.Module):
         if debug and self.i % 2 == 0 and not (save_path is None):
             pred_bev = self.pred_bev(features[0])
             pred_bev = F.interpolate(pred_bev, (self.config.bev_resolution_height, self.config.bev_resolution_width), mode='bilinear', align_corners=True)
-            pred_semantic = self.seg_decoder(image_features_grid)
-            pred_depth = self.depth_decoder(image_features_grid)
+            pred_semantic = self.seg_decoder(image_features_grid) if self.config.multitask else None
+            pred_depth = self.depth_decoder(image_features_grid) if self.config.multitask else None
 
             self.visualize_model_io(save_path, self.i, self.config, rgb, lidar_bev, target_point,
                             pred_wp, pred_bev, pred_semantic, pred_depth, bboxes, self.device,
@@ -749,8 +801,10 @@ class LidarCenterNet(nn.Module):
             features, image_features_grid, fused_features = self._model(rgb, lidar_bev, ego_vel, bev_points, cam_points)
         elif (self.backbone == 'latentTF'):
             features, image_features_grid, fused_features = self._model(rgb, lidar_bev, ego_vel)
+        elif (self.backbone == 'lidar_only'):
+            features, image_features_grid, fused_features = self._model(rgb, lidar_bev, ego_vel)
         else:
-            raise ("The chosen vision backbone does not exist. The options are: transFuser, late_fusion, geometric_fusion, latentTF")
+            raise ("The chosen vision backbone does not exist. The options are: transFuser, late_fusion, geometric_fusion, latentTF, lidar_only")
 
 
         pred_wp, _, _, _, _ = self.forward_gru(fused_features, target_point)
@@ -787,6 +841,8 @@ class LidarCenterNet(nn.Module):
                 "loss_semantic": loss_semantic
             })
         else:
+            pred_semantic = None
+            pred_depth = None
             loss.update({
                 "loss_depth": torch.zeros_like(loss_wp),
                 "loss_semantic": torch.zeros_like(loss_wp)
@@ -1021,11 +1077,14 @@ class LidarCenterNet(nn.Module):
 
         bev_image = np.array(bev_image)
 
-        rgb_image = rgb[i].permute(1, 2, 0).detach().cpu().numpy()[:, :, [2, 1, 0]]
-        rgb_image = cv2.resize(rgb_image, (1280 + 128, 320 + 32))
-        assert (config.multitask)
-        images = np.concatenate((bev_image, images, ds_image), axis=1)
+        if config.multitask:
+            images = np.concatenate((bev_image, images, ds_image), axis=1)
+        else:
+            images = np.concatenate((bev_image, images), axis=1)
 
-        images = np.concatenate((rgb_image, images), axis=0)
+        if rgb is not None:
+            rgb_image = rgb[i].permute(1, 2, 0).detach().cpu().numpy()[:, :, [2, 1, 0]]
+            rgb_image = cv2.resize(rgb_image, (1280 + 128, 320 + 32))
+            images = np.concatenate((rgb_image, images), axis=0)
 
         cv2.imwrite(str(save_path + ("/%d.png" % (step // 2))), images)

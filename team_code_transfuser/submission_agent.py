@@ -37,6 +37,11 @@ class HybridAgent(autonomous_agent.AutonomousAgent):
         self.config_path = path_to_conf_file
         self.step = -1
         self.initialized = False
+        self.route_index = route_index
+        # Some GPUs (e.g. an RTX 50-series here) are too new for this old
+        # CUDA/PyTorch build to run kernels on; closed-loop inference is
+        # cheap enough (no gradients) to fall back to CPU for those.
+        self.device = os.environ.get('SUBMISSION_DEVICE', 'cuda')
 
         args_file = open(os.path.join(path_to_conf_file, 'args.txt'), 'r')
         self.args = json.load(args_file)
@@ -44,6 +49,49 @@ class HybridAgent(autonomous_agent.AutonomousAgent):
 
         # setting machine to avoid loading files
         self.config = GlobalConfig(setting='eval')
+        self.artifact_dir = None
+        self.save_path = None
+        if SAVE_PATH is not None:
+            route_id = os.environ.get(
+                'LEADERBOARD_ROUTE_ID',
+                os.environ.get('LEADERBOARD_ROUTE_INDEX', 'unknown'),
+            )
+            repetition = os.environ.get('LEADERBOARD_REPETITION', '0')
+            safe_route_id = ''.join(
+                char if char.isalnum() or char in ('-', '_') else '_'
+                for char in str(route_id)
+            )
+            if safe_route_id.isdigit():
+                safe_route_id = '%02d' % int(safe_route_id)
+            self.artifact_dir = (
+                pathlib.Path(SAVE_PATH)
+                / ('route_%s_rep%s' % (safe_route_id, repetition))
+            )
+            frames_dir = self.artifact_dir / 'frames'
+            frames_dir.mkdir(parents=True, exist_ok=True)
+            self.save_path = str(frames_dir)
+            self.config.debug = (
+                os.environ.get('SAVE_COMPOSITE_FRAMES', '1') == '1'
+            )
+
+            metadata = {
+                'route_index': os.environ.get('LEADERBOARD_ROUTE_INDEX'),
+                'route_id': route_id,
+                'route_name': os.environ.get('LEADERBOARD_ROUTE_NAME'),
+                'repetition': int(repetition),
+                'checkpoint_dir': str(path_to_conf_file),
+                'composite_frames_enabled': self.config.debug,
+                'control_telemetry_hz': 10,
+                'composite_frame_hz': 5 if self.config.debug else 0,
+                'composite_contents': [
+                    'rgb_panorama', 'lidar_bev', 'predicted_bev',
+                    'predicted_semantic', 'predicted_depth',
+                    'predicted_waypoints', 'target_point',
+                ],
+            }
+            with (self.artifact_dir / 'run_metadata.json').open(
+                    'w', encoding='utf-8') as metadata_file:
+                json.dump(metadata, metadata_file, indent=2)
 
         if ('sync_batch_norm' in self.args):
             self.config.sync_batch_norm = bool(self.args['sync_batch_norm'])
@@ -69,9 +117,19 @@ class HybridAgent(autonomous_agent.AutonomousAgent):
             lidar_architecture = 'resnet18'
 
         if ('backbone' in self.args):
-            self.backbone = self.args['backbone']  # Options 'geometric_fusion', 'transFuser', 'late_fusion', 'latentTF'
+            self.backbone = self.args['backbone']  # Options 'geometric_fusion', 'transFuser', 'late_fusion', 'latentTF', 'lidar_only'
         else:
-            self.backbone = 'transFuser'  # Options 'geometric_fusion', 'transFuser', 'late_fusion', 'latentTF'
+            self.backbone = 'transFuser'  # Options 'geometric_fusion', 'transFuser', 'late_fusion', 'latentTF', 'lidar_only'
+        self.config.multitask = bool(self.args.get('multitask', 1))
+        if self.backbone == 'lidar_only':
+            self.config.multitask = False
+            if self.artifact_dir is not None:
+                metadata['composite_contents'] = [
+                    'lidar_bev', 'predicted_bev', 'predicted_waypoints', 'target_point'
+                ]
+                with (self.artifact_dir / 'run_metadata.json').open(
+                        'w', encoding='utf-8') as metadata_file:
+                    json.dump(metadata, metadata_file, indent=2)
 
         self.gps_buffer = deque(maxlen=self.config.gps_buffer_max_len) # Stores the last x updated gps signals.
         self.ego_model = EgoModel(dt=self.config.carla_frame_rate) # Bicycle model used for de-noising the GPS
@@ -88,19 +146,37 @@ class HybridAgent(autonomous_agent.AutonomousAgent):
             if file.endswith(".pth"):
                 self.model_count += 1
                 print(os.path.join(path_to_conf_file, file))
-                net = LidarCenterNet(self.config, 'cuda', self.backbone, image_architecture, lidar_architecture, use_velocity)
+                net = LidarCenterNet(self.config, self.device, self.backbone, image_architecture, lidar_architecture, use_velocity)
                 if(self.config.sync_batch_norm == True):
                     net = torch.nn.SyncBatchNorm.convert_sync_batchnorm(net) # Model was trained with Sync. Batch Norm. Need to convert it otherwise parameters will load incorrectly.
-                state_dict = torch.load(os.path.join(path_to_conf_file, file), map_location='cuda:0')
-                state_dict = {k[7:]: v for k, v in state_dict.items()} # Removes the .module coming from the Distributed Training. Remove this if you want to evaluate a model trained without DDP.
+                state_dict = torch.load(os.path.join(path_to_conf_file, file), map_location=self.device)
+                # DDP checkpoints have a "module." prefix; single-GPU
+                # checkpoints do not.  Accept both without altering tensors.
+                if state_dict and all(k.startswith('module.') for k in state_dict):
+                    state_dict = {k[7:]: v for k, v in state_dict.items()}
                 net.load_state_dict(state_dict, strict=False)
-                net.cuda()
+                net.to(self.device)
                 net.eval()
                 self.nets.append(net)
 
 
         self.stuck_detector = 0
         self.forced_move = 0
+        self.recovery_frames_remaining = 0
+        self.recovery_cooldown = 0
+        self.recovery_attempts = 0
+        self.recovery_exhausted = False
+
+        self.telemetry_file = None
+        telemetry_path_env = os.environ.get('CONTROL_LOG_PATH')
+        if self.artifact_dir is not None or telemetry_path_env:
+            telemetry_path = (
+                self.artifact_dir / 'control_telemetry.jsonl'
+                if self.artifact_dir is not None
+                else pathlib.Path(telemetry_path_env)
+            )
+            telemetry_path.parent.mkdir(parents=True, exist_ok=True)
+            self.telemetry_file = telemetry_path.open('a', buffering=1)
 
         self.use_lidar_safe_check = True
         self.aug_degrees = [0] # Test time data augmentation. Unused we only augment by 0 degree.
@@ -120,8 +196,9 @@ class HybridAgent(autonomous_agent.AutonomousAgent):
         return gps
 
     def sensors(self):
-        sensors = [
-                    {
+        sensors = []
+        if self.backbone != 'lidar_only':
+            sensors.extend([{
                         'type': 'sensor.camera.rgb',
                         'x': self.config.camera_pos[0], 'y': self.config.camera_pos[1], 'z':self.config.camera_pos[2],
                         'roll': self.config.camera_rot_0[0], 'pitch': self.config.camera_rot_0[1], 'yaw': self.config.camera_rot_0[2],
@@ -141,8 +218,8 @@ class HybridAgent(autonomous_agent.AutonomousAgent):
                         'roll': self.config.camera_rot_2[0], 'pitch': self.config.camera_rot_2[1], 'yaw': self.config.camera_rot_2[2],
                         'width': self.config.camera_width, 'height': self.config.camera_height, 'fov': self.config.camera_fov,
                         'id': 'rgb_right'
-                        },
-                    {
+                        }])
+        sensors.extend([{
                         'type': 'sensor.other.imu',
                         'x': 0.0, 'y': 0.0, 'z': 0.0,
                         'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0,
@@ -160,9 +237,13 @@ class HybridAgent(autonomous_agent.AutonomousAgent):
                         'type': 'sensor.speedometer',
                         'reading_frequency': self.config.carla_fps,
                         'id': 'speed'
-                        }
-                    ]
-        if(SAVE_PATH != None): #Debug camera for visualizations
+                    }])
+        self.save_rear_camera = (
+            self.save_path is not None
+            and os.environ.get('SAVE_REAR_CAMERA', '0') == '1'
+            and self.backbone != 'lidar_only'
+        )
+        if self.save_rear_camera: # Optional camera, not used by the controller.
             sensors.append({
                             'type': 'sensor.camera.rgb',
                             'x': -4.5, 'y': 0.0, 'z':2.3,
@@ -182,30 +263,35 @@ class HybridAgent(autonomous_agent.AutonomousAgent):
         return sensors
 
     def tick(self, input_data):
-        rgb = []
-        for pos in ['left', 'front', 'right']:
-            rgb_cam = 'rgb_' + pos
-            rgb_pos = cv2.cvtColor(input_data[rgb_cam][1][:, :, :3], cv2.COLOR_BGR2RGB)
-            rgb_pos = self.scale_crop(Image.fromarray(rgb_pos), self.config.scale, self.config.img_width, self.config.img_width, self.config.img_resolution[0], self.config.img_resolution[0])
-            rgb.append(rgb_pos)
-        rgb = np.concatenate(rgb, axis=1)
+        if self.backbone != 'lidar_only':
+            rgb = []
+            for pos in ['left', 'front', 'right']:
+                rgb_cam = 'rgb_' + pos
+                rgb_pos = cv2.cvtColor(input_data[rgb_cam][1][:, :, :3], cv2.COLOR_BGR2RGB)
+                rgb_pos = self.scale_crop(Image.fromarray(rgb_pos), self.config.scale, self.config.img_width, self.config.img_width, self.config.img_resolution[0], self.config.img_resolution[0])
+                rgb.append(rgb_pos)
+            rgb = np.concatenate(rgb, axis=1)
 
-        if(SAVE_PATH != None): #Debug camera for visualizations
+        if self.save_rear_camera: # Debug camera for visualizations
             # don't need buffer for it always use the latest one
             self.rgb_back = input_data["rgb_back"][1][:, :, :3]
 
         gps = input_data['gps'][1][:2]
-        speed = input_data['speed'][1]['speed']
+        speed_data = input_data['speed'][1]
+        speed = speed_data['speed']
+        pitch = float(speed_data.get('pitch', 0.0))
         compass = input_data['imu'][1][-1]
         if (np.isnan(compass) == True): # CARLA 0.9.10 occasionally sends NaN values in the compass
             compass = 0.0
 
         result = {
-                'rgb': rgb,
                 'gps': gps,
                 'speed': speed,
+                'pitch': pitch,
                 'compass': compass,
                 }
+        if self.backbone != 'lidar_only':
+            result['rgb'] = rgb
 
         if (self.backbone != 'latentTF'):
             lidar = input_data['lidar'][1][:, :3]
@@ -254,18 +340,18 @@ class HybridAgent(autonomous_agent.AutonomousAgent):
             return self.control
 
         # prepare image input
-        image = self.prepare_image(tick_data)
+        image = None if self.backbone == 'lidar_only' else self.prepare_image(tick_data)
 
         num_points = None
         if(self.backbone == 'latentTF'): # Image only method
-            lidar_bev = torch.zeros((1, 2, self.config.lidar_resolution_width, self.config.lidar_resolution_height)).to('cuda', dtype=torch.float32) #Dummy data
+            lidar_bev = torch.zeros((1, 2, self.config.lidar_resolution_width, self.config.lidar_resolution_height)).to(self.device, dtype=torch.float32) #Dummy data
         else:
             # prepare LiDAR input
             if (self.config.use_point_pillars == True):
                 lidar_cloud = deepcopy(input_data['lidar'][1])
                 lidar_cloud[:, 1] *= -1  # invert
-                lidar_bev = [torch.tensor(lidar_cloud).to('cuda', dtype=torch.float32)]
-                num_points = [torch.tensor(len(lidar_cloud)).to('cuda', dtype=torch.int32)]
+                lidar_bev = [torch.tensor(lidar_cloud).to(self.device, dtype=torch.float32)]
+                num_points = [torch.tensor(len(lidar_cloud)).to(self.device, dtype=torch.int32)]
             else:
                 lidar_bev = self.prepare_lidar(tick_data)
 
@@ -274,16 +360,28 @@ class HybridAgent(autonomous_agent.AutonomousAgent):
         target_point_image, target_point = self.prepare_goal_location(tick_data)
 
         # prepare velocity input
-        gt_velocity = torch.FloatTensor([tick_data['speed']]).to('cuda', dtype=torch.float32) # used by controller
+        gt_velocity = torch.FloatTensor([tick_data['speed']]).to(self.device, dtype=torch.float32) # used by controller
         velocity = gt_velocity.reshape(1, 1) # used by transfuser
 
-        # unblock
-        is_stuck = False
-        # divide by 2 because we process every second frame
-        # 1100 = 55 seconds * 20 Frames per second, we move for 1.5 second = 30 frames to unblock
-        if(self.stuck_detector > self.config.stuck_threshold and self.forced_move < self.config.creep_duration):
-            print("Detected agent being stuck. Move for frame: ", self.forced_move)
-            is_stuck = True
+        # Start a recovery attempt after sustained low speed.  Attempts are a
+        # state machine so a failed launch can be retried instead of leaving
+        # ``forced_move`` permanently at its terminal value.
+        if (self.recovery_frames_remaining <= 0
+                and self.recovery_cooldown <= 0
+                and not self.recovery_exhausted
+                and self.recovery_attempts < self.config.max_recovery_attempts
+                and self.stuck_detector >= self.config.stuck_threshold):
+            self.recovery_attempts += 1
+            self.recovery_frames_remaining = self.config.creep_duration
+            self.forced_move = 0
+            self.stuck_detector = 0
+            print(
+                "Detected agent being stuck. Starting recovery attempt:",
+                self.recovery_attempts,
+            )
+
+        is_stuck = self.recovery_frames_remaining > 0
+        if is_stuck:
             self.forced_move += 1
 
 
@@ -294,26 +392,46 @@ class HybridAgent(autonomous_agent.AutonomousAgent):
             for i in range(self.model_count):
                 rotated_bb = []
                 if (self.backbone == 'transFuser'):
+                    net_save_path = self.save_path if i == 0 else None
                     pred_wp, _ = self.nets[i].forward_ego(image, lidar_bev, target_point, target_point_image, velocity,
-                                                          num_points=num_points, save_path=SAVE_PATH, stuck_detector=self.stuck_detector,
+                                                          num_points=num_points, save_path=net_save_path, stuck_detector=self.stuck_detector,
                                                           forced_move=is_stuck, debug=self.config.debug, rgb_back=self.rgb_back)
                 elif (self.backbone == 'late_fusion'):
-                    pred_wp, _ = self.nets[i].forward_ego(image, lidar_bev, target_point, target_point_image, velocity, num_points=num_points)
+                    net_save_path = self.save_path if i == 0 else None
+                    pred_wp, _ = self.nets[i].forward_ego(
+                        image, lidar_bev, target_point, target_point_image, velocity,
+                        num_points=num_points, save_path=net_save_path,
+                        stuck_detector=self.stuck_detector, forced_move=is_stuck,
+                        debug=self.config.debug)
+                elif (self.backbone == 'lidar_only'):
+                    net_save_path = self.save_path if i == 0 else None
+                    pred_wp, _ = self.nets[i].forward_ego(
+                        image, lidar_bev, target_point, target_point_image, velocity,
+                        num_points=num_points, save_path=net_save_path,
+                        stuck_detector=self.stuck_detector, forced_move=is_stuck,
+                        debug=self.config.debug)
                 elif (self.backbone == 'geometric_fusion'):
                     bev_points = list()
                     cam_points = list()
 
-                    curr_bev_points, curr_cam_points = lidar_bev_cam_correspondences(deepcopy(tick_data['lidar']), lidar_bev, image, self.step, False)
+                    curr_bev_points, curr_cam_points = lidar_bev_cam_correspondences(
+                        deepcopy(tick_data['lidar']), lidar_bev, image, self.step, False,
+                        cam_z=self.config.camera_pos[2], lidar_z=self.config.lidar_pos[2])
                     bev_points.append(torch.from_numpy(curr_bev_points).unsqueeze(0))
                     cam_points.append(torch.from_numpy(curr_cam_points).unsqueeze(0))
 
-                    bev_points = bev_points[0].long().to('cuda', dtype=torch.int64)
-                    cam_points = cam_points[0].long().to('cuda', dtype=torch.int64)
+                    bev_points = bev_points[0].long().to(self.device, dtype=torch.int64)
+                    cam_points = cam_points[0].long().to(self.device, dtype=torch.int64)
                     pred_wp, _ = self.nets[i].forward_ego(image, lidar_bev, target_point, target_point_image, velocity, bev_points, cam_points, num_points=num_points)
                 elif (self.backbone == 'latentTF'):
-                    pred_wp, rotated_bb = self.nets[i].forward_ego(image, lidar_bev, target_point, target_point_image, velocity, num_points=num_points)
+                    net_save_path = self.save_path if i == 0 else None
+                    pred_wp, rotated_bb = self.nets[i].forward_ego(
+                        image, lidar_bev, target_point, target_point_image, velocity,
+                        num_points=num_points, save_path=net_save_path,
+                        stuck_detector=self.stuck_detector, forced_move=is_stuck,
+                        debug=self.config.debug)
                 else:
-                    raise ("The chosen vision backbone does not exist. The options are: transFuser, late_fusion, geometric_fusion, latentTF")
+                    raise ("The chosen vision backbone does not exist. The options are: transFuser, late_fusion, geometric_fusion, latentTF, lidar_only")
 
                 pred_wps.append(pred_wp)
                 bounding_boxes.append(rotated_bb)
@@ -336,7 +454,7 @@ class HybridAgent(autonomous_agent.AutonomousAgent):
             pred_wp_transformed.append(transformed_wp)
 
         self.pred_wp = np.stack(pred_wp_transformed, axis=0)
-        self.pred_wp = torch.median(torch.from_numpy(self.pred_wp).to('cuda', dtype=torch.float32), dim=0, keepdims=True)[0]
+        self.pred_wp = torch.median(torch.from_numpy(self.pred_wp).to(self.device, dtype=torch.float32), dim=0, keepdims=True)[0]
 
         if (self.backbone == 'latentTF'):
             safety_box = []
@@ -359,19 +477,17 @@ class HybridAgent(autonomous_agent.AutonomousAgent):
             safety_box      = safety_box[safety_box[..., 0] > self.config.safety_box_x_min]
             safety_box      = safety_box[safety_box[..., 0] < self.config.safety_box_x_max]
 
-        steer, throttle, brake = self.nets[0].control_pid(self.pred_wp, gt_velocity, is_stuck)
+        steer, throttle, brake, control_meta = self.nets[0].control_pid(
+            self.pred_wp, gt_velocity, is_stuck, pitch=tick_data['pitch'])
         
         if is_stuck and self.forced_move==1: # no steer for initial frame when unblocking
             steer = 0.0
 
         # steer modulation
-        if brake or is_stuck:
+        if brake >= 0.9 or is_stuck:
             steer *= self.steer_damping
-        if(gt_velocity < 0.1): # 0.1 is just an arbitrary low number to threshhold when the car is stopped
-            self.stuck_detector += 1
-        elif(gt_velocity > 0.1 and is_stuck == False):
-            self.stuck_detector = 0
-            self.forced_move    = 0
+        steer_limit = steering_limit_for_speed(tick_data['speed'])
+        steer = float(np.clip(steer, -steer_limit, steer_limit))
 
         control = carla.VehicleControl()
         control.steer = float(steer)
@@ -379,19 +495,82 @@ class HybridAgent(autonomous_agent.AutonomousAgent):
         control.brake = float(brake)
 
         # Safety controller. Stops the car in case something is directly in front of it.
+        emergency_stop = False
         if self.use_lidar_safe_check:
             emergency_stop = (len(safety_box) > 0) #Checks if the List is empty
-            if ((emergency_stop == True) and (is_stuck == True)):  # We only use the saftey box when unblocking
+            if emergency_stop and is_stuck:  # We only use the safety box when unblocking
                 print("Detected object directly in front of the vehicle. Stopping. Step:", self.step)
                 control.steer = float(steer)
                 control.throttle = float(0.0)
-                control.brake = float(True)
-                # Will overwrite the stuck detector. If we are stuck in traffic we do want to wait it out.
+                control.brake = 1.0
+
+        speed_value = float(tick_data['speed'])
+        if speed_value > self.config.stuck_release_speed:
+            self.stuck_detector = 0
+            self.forced_move = 0
+            self.recovery_frames_remaining = 0
+            self.recovery_cooldown = 0
+            self.recovery_attempts = 0
+            self.recovery_exhausted = False
+        elif is_stuck:
+            # The attempt has a fixed wall-clock window even when the safety
+            # box suppresses throttle. Otherwise one persistent LiDAR return
+            # could leave the agent in recovery forever.
+            self.recovery_frames_remaining -= 1
+            if self.recovery_frames_remaining <= 0:
+                self.forced_move = 0
+                if self.recovery_attempts >= self.config.max_recovery_attempts:
+                    self.recovery_exhausted = True
+                    self.recovery_cooldown = 0
+                    print(
+                        "Recovery exhausted after attempts:",
+                        self.recovery_attempts,
+                    )
+                else:
+                    self.recovery_cooldown = self.config.stuck_retry_delay
+        elif speed_value < self.config.stuck_speed_threshold:
+            if self.recovery_exhausted:
+                pass
+            elif self.recovery_cooldown > 0:
+                self.recovery_cooldown -= 1
+            else:
+                self.stuck_detector += 1
+        else:
+            self.stuck_detector = 0
+
+        telemetry = {
+            'step': self.step,
+            'timestamp': float(timestamp),
+            'speed': speed_value,
+            'pitch': float(tick_data['pitch']),
+            'target_point_x': float(tick_data['target_point'][0]),
+            'target_point_y': float(tick_data['target_point'][1]),
+            'learned_desired_speed': control_meta['learned_desired_speed'],
+            'desired_speed': control_meta['desired_speed'],
+            'steer': control.steer,
+            'throttle': control.throttle,
+            'brake': control.brake,
+            'safety_box_points': int(len(safety_box)),
+            'safety_stop': bool(emergency_stop and is_stuck),
+            'recovery_active': bool(is_stuck),
+            'recovery_attempt': self.recovery_attempts,
+            'recovery_exhausted': self.recovery_exhausted,
+            'recovery_frames_remaining': self.recovery_frames_remaining,
+            'stuck_frames': self.stuck_detector,
+        }
+        self._write_telemetry(telemetry)
 
         self.control = control
 
         self.update_gps_buffer(self.control, tick_data['compass'], tick_data['speed'])
         return control
+
+    def _write_telemetry(self, telemetry):
+        if self.telemetry_file is not None:
+            self.telemetry_file.write(json.dumps(telemetry) + '\n')
+        if (os.environ.get('CONTROL_DEBUG', '0') == '1'
+                and self.step % 40 == 0):
+            print('HD465 control:', json.dumps(telemetry, sort_keys=True))
 
     def bb_detected_in_front_of_vehicle(self, ego_speed):
         if (len(self.bb_buffer) < 1):  # We only start after we have 4 time steps.
@@ -484,7 +663,7 @@ class HybridAgent(autonomous_agent.AutonomousAgent):
         for degree in self.aug_degrees:
             crop_shift = degree / 60 * self.config.img_width
             rgb = torch.from_numpy(self.shift_x_scale_crop(image, scale=self.config.scale, crop=self.config.img_resolution, crop_shift=crop_shift)).unsqueeze(0)
-            image_degrees.append(rgb.to('cuda', dtype=torch.float32))
+            image_degrees.append(rgb.to(self.device, dtype=torch.float32))
         image = torch.cat(image_degrees, dim=0)
         return image
 
@@ -541,15 +720,16 @@ class HybridAgent(autonomous_agent.AutonomousAgent):
     def prepare_lidar(self, tick_data):
         lidar_transformed = deepcopy(tick_data['lidar']) 
         lidar_transformed[:, 1] *= -1  # invert
-        lidar_transformed = torch.from_numpy(lidar_to_histogram_features(lidar_transformed)).unsqueeze(0)
-        lidar_transformed_degrees = [lidar_transformed.to('cuda', dtype=torch.float32)]
+        lidar_transformed = torch.from_numpy(lidar_to_histogram_features(
+            lidar_transformed, lidar_z=self.config.lidar_pos[2])).unsqueeze(0)
+        lidar_transformed_degrees = [lidar_transformed.to(self.device, dtype=torch.float32)]
         lidar_bev = torch.cat(lidar_transformed_degrees[::-1], dim=1)
         return lidar_bev
 
     def prepare_goal_location(self, tick_data):
         tick_data['target_point'] = [torch.FloatTensor([tick_data['target_point'][0]]),
                                             torch.FloatTensor([tick_data['target_point'][1]])]
-        target_point = torch.stack(tick_data['target_point'], dim=1).to('cuda', dtype=torch.float32)
+        target_point = torch.stack(tick_data['target_point'], dim=1).to(self.device, dtype=torch.float32)
 
         target_point_image_degrees = []
         target_point_degrees = []
@@ -560,13 +740,14 @@ class HybridAgent(autonomous_agent.AutonomousAgent):
 
             current_target_point = (degree_matrix @ target_point[0].cpu().numpy().reshape(2, 1)).T
 
-            target_point_image = draw_target_point(current_target_point[0])
-            target_point_image = torch.from_numpy(target_point_image)[None].to('cuda', dtype=torch.float32)
+            target_point_image = draw_target_point(
+                current_target_point[0], lidar_x=self.config.lidar_pos[0])
+            target_point_image = torch.from_numpy(target_point_image)[None].to(self.device, dtype=torch.float32)
             target_point_image_degrees.append(target_point_image)
             target_point_degrees.append(torch.from_numpy(current_target_point))
 
         target_point_image = torch.cat(target_point_image_degrees, dim=0)
-        target_point = torch.cat(target_point_degrees, dim=0).to('cuda', dtype=torch.float32)
+        target_point = torch.cat(target_point_degrees, dim=0).to(self.device, dtype=torch.float32)
 
         return target_point_image, target_point
 
@@ -598,6 +779,9 @@ class HybridAgent(autonomous_agent.AutonomousAgent):
         return cropped_image
 
     def destroy(self):
+        if self.telemetry_file is not None:
+            self.telemetry_file.close()
+            self.telemetry_file = None
         del self.nets
 
 # Taken from LBC
@@ -659,43 +843,59 @@ class RoutePlanner(object):
         self.route = self.saved_route
         self.is_last = False
 
-# Taken from World on Rails
-class EgoModel():
-    def __init__(self, dt=1./4):
-        self.dt = dt
-        
-        # Kinematic bicycle model. Numbers are the tuned parameters from World on Rails
-        self.front_wb    = -0.090769015
-        self.rear_wb     = 1.4178275
+def steering_limit_for_speed(speed_mps):
+    """HD465 normalized steering cap, shared with the mining expert."""
+    speed_kmh = max(0.0, float(speed_mps)) * 3.6
+    speed_axis = np.array([0.0, 10.0, 20.0, 30.0, 40.0, 50.0])
+    steer_axis = np.array([1.0, 0.90, 0.70, 0.50, 0.35, 0.25])
+    return float(np.interp(speed_kmh, speed_axis, steer_axis))
 
-        self.steer_gain  = 0.36848336
-        self.brake_accel = -4.952399
-        self.throt_accel = 0.5633837
+
+class EgoModel():
+    """Effective bicycle model identified from the cooked HD465 asset.
+
+    This model only advances the noisy GPS history between sensor updates; it
+    does not alter CARLA's physical vehicle dynamics.
+    """
+
+    def __init__(self, dt=1./4):
+        self.dt = float(dt)
+        self.front_wb = 2.149
+        self.rear_wb = 2.149
+        self.steer_gain = 0.507
+        self.throttle_accel = 1.75
+        self.brake_decel = 3.10
+        self.coast_decel = 0.19
+
+    @staticmethod
+    def _scalar(value):
+        return float(np.asarray(value).reshape(-1)[0])
 
     def forward(self, locs, yaws, spds, acts):
-        # Kinematic bicycle model. Numbers are the tuned parameters from World on Rails
-        steer = acts[..., 0:1].item()
-        throt = acts[..., 1:2].item()
-        brake = acts[..., 2:3].astype(np.uint8)
+        action = np.asarray(acts).reshape(-1)
+        steer = float(np.clip(action[0], -1.0, 1.0))
+        throttle = float(np.clip(action[1], 0.0, 1.0))
+        brake = float(np.clip(action[2], 0.0, 1.0))
 
-        if (brake):
-            accel = self.brake_accel
+        if brake > 1e-4:
+            acceleration = -self.brake_decel * brake
+        elif throttle > 1e-4:
+            acceleration = self.throttle_accel * throttle
         else:
-            accel = self.throt_accel * throt
+            acceleration = -self.coast_decel
 
-        wheel = self.steer_gain * steer
-
-        beta = math.atan(self.rear_wb / (self.front_wb + self.rear_wb) * math.tan(wheel))
-        yaws = yaws.item()
-        spds = spds.item()
-        next_locs_0 = locs[0].item() + spds * math.cos(yaws + beta) * self.dt
-        next_locs_1 = locs[1].item() + spds * math.sin(yaws + beta) * self.dt
-        next_yaws = yaws + spds / self.rear_wb * math.sin(beta) * self.dt
-        next_spds = spds + accel * self.dt
-        next_spds = next_spds * (next_spds > 0.0)  # Fast ReLU
-
-        next_locs = np.array([next_locs_0, next_locs_1])
-        next_yaws = np.array(next_yaws)
-        next_spds = np.array(next_spds)
-
-        return next_locs, next_yaws, next_spds
+        wheel_angle = self.steer_gain * steer
+        beta = math.atan(
+            self.rear_wb / (self.front_wb + self.rear_wb)
+            * math.tan(wheel_angle)
+        )
+        loc = np.asarray(locs, dtype=np.float64).reshape(-1)
+        yaw = self._scalar(yaws)
+        speed = max(0.0, self._scalar(spds))
+        next_locs = np.array([
+            loc[0] + speed * math.cos(yaw + beta) * self.dt,
+            loc[1] + speed * math.sin(yaw + beta) * self.dt,
+        ])
+        next_yaw = yaw + speed / self.rear_wb * math.sin(beta) * self.dt
+        next_speed = max(0.0, speed + acceleration * self.dt)
+        return next_locs, np.array(next_yaw), np.array(next_speed)

@@ -76,6 +76,8 @@ class AgentWrapper(object):
         Set the autonomous agent
         """
         self._agent = agent
+        # Do not share sensor references between wrapper instances/routes.
+        self._sensors_list = []
 
     def __call__(self):
         """
@@ -254,3 +256,6 @@ class AgentWrapper(object):
                 self._sensors_list[i].destroy()
                 self._sensors_list[i] = None
         self._sensors_list = []
+        if self._agent is not None and hasattr(self._agent, 'sensor_interface'):
+            self._agent.sensor_interface.clear()
+        self._agent = None

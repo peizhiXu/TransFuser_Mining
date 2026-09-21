@@ -37,7 +37,8 @@ def main():
     parser.add_argument('--start_epoch', type=int, default=0, help='Epoch to start with. Useful when continuing trainings via load_file.')
     parser.add_argument('--setting', type=str, default='all', help='What training setting to use. Options: '
                                                                    'all: Train on all towns no validation data. '
-                                                                   '02_05_withheld: Do not train on Town 02 and Town 05. Use the data as validation data.')
+                                                                   '02_05_withheld: Do not train on Town 02 and Town 05. Use the data as validation data. '
+                                                                   'mining: Use explicit train/ and val/ route directories.')
     parser.add_argument('--root_dir', type=str, default=r'/mnt/qb/geiger/kchitta31/datasets/carla/pami_v1_dataset_23_11', help='Root directory of your training data')
     parser.add_argument('--schedule', type=int, default=1,
                         help='Whether to train with a learning rate schedule. 1 = True')
@@ -46,7 +47,9 @@ def main():
     parser.add_argument('--schedule_reduce_epoch_02', type=int, default=40,
                         help='Epoch at which to reduce the lr by a factor of 10 the second time. Only used with --schedule 1')
     parser.add_argument('--backbone', type=str, default='transFuser',
-                        help='Which Fusion backbone to use. Options: transFuser, late_fusion, latentTF, geometric_fusion')
+                        help='Which Fusion backbone to use. Options: transFuser, late_fusion, latentTF, geometric_fusion, lidar_only. '
+                             'latentTF is the camera-only ablation (LiDAR input replaced by a positional encoding), lidar_only is the LiDAR-only ablation (no image branch). '
+                             'lidar_only automatically disables camera-view semantic/depth aux losses.')
     parser.add_argument('--image_architecture', type=str, default='regnety_032',
                         help='Which architecture to use for the image branch. efficientnet_b0, resnet34, regnety_032 etc.')
     parser.add_argument('--lidar_architecture', type=str, default='regnety_032',
@@ -65,12 +68,18 @@ def main():
                              ' the code will be parallelized across GPUs. If set to false/0, you launch the script with python train.py and only 1 GPU will be used.')
     parser.add_argument('--val_every', type=int, default=5, help='At which epoch frequency to validate.')
     parser.add_argument('--no_bev_loss', type=int, default=0, help='If set to true the BEV loss will not be trained. 0: Train normally, 1: set training weight for BEV to 0')
+    parser.add_argument('--no_semantic_loss', type=int, default=0, help='Set semantic loss weight to 0 when labels contain no valid task classes.')
+    parser.add_argument('--multitask', type=int, default=1, help='Whether to train the semantic/depth aux heads. 1:True, 0:False. '
+                                                                  'Automatically set to 0 for --backbone lidar_only.')
     parser.add_argument('--sync_batch_norm', type=int, default=0, help='0: Compute batch norm for each GPU independently, 1: Synchronize Batch norms accross GPUs. Only use with --parallel_training 1')
     parser.add_argument('--zero_redundancy_optimizer', type=int, default=0, help='0: Normal AdamW Optimizer, 1: Use Zero Reduncdancy Optimizer to reduce memory footprint. Only use with --parallel_training 1')
     parser.add_argument('--use_disk_cache', type=int, default=0, help='0: Do not cache the dataset 1: Cache the dataset on the disk pointed to by the SCRATCH enironment variable. Useful if the dataset is stored on slow HDDs and can be temporarily stored on faster SSD storage.')
 
 
     args = parser.parse_args()
+    if args.backbone == 'lidar_only':
+        # LiDAR-only has no camera-view features for depth/semantic heads.
+        args.multitask = 0
     args.logdir = os.path.join(args.logdir, args.id)
     parallel = bool(args.parallel_training)
 
@@ -120,9 +129,13 @@ def main():
     config.n_layer = args.n_layer
     config.use_point_pillars = bool(args.use_point_pillars)
     config.backbone = args.backbone
+    config.multitask = bool(args.multitask)
     if(bool(args.no_bev_loss)):
         index_bev = config.detailed_losses.index("loss_bev")
         config.detailed_losses_weights[index_bev] = 0.0
+    if(bool(args.no_semantic_loss)):
+        index_semantic = config.detailed_losses.index("loss_semantic")
+        config.detailed_losses_weights[index_semantic] = 0.0
 
     # Create model and optimizers
     model = LidarCenterNet(config, device, args.backbone, args.image_architecture, args.lidar_architecture, bool(args.use_velocity))
@@ -149,18 +162,19 @@ def main():
     # Data
     train_set = CARLA_Data(root=config.train_data, config=config, shared_dict=shared_dict)
     val_set   = CARLA_Data(root=config.val_data,   config=config, shared_dict=shared_dict)
+    val_set.augment = np.array(False)
 
     g_cuda = torch.Generator(device='cpu')
     g_cuda.manual_seed(torch.initial_seed())
 
     if(parallel == True):
         sampler_train = torch.utils.data.distributed.DistributedSampler(train_set, shuffle=True, num_replicas=world_size, rank=rank)
-        sampler_val   = torch.utils.data.distributed.DistributedSampler(val_set,   shuffle=True, num_replicas=world_size, rank=rank)
+        sampler_val   = torch.utils.data.distributed.DistributedSampler(val_set,   shuffle=False, num_replicas=world_size, rank=rank)
         dataloader_train = DataLoader(train_set, sampler=sampler_train, batch_size=args.batch_size, worker_init_fn=seed_worker, generator=g_cuda, num_workers=8, pin_memory=True)
         dataloader_val   = DataLoader(val_set,   sampler=sampler_val,   batch_size=args.batch_size, worker_init_fn=seed_worker, generator=g_cuda, num_workers=8, pin_memory=True)
     else:
       dataloader_train = DataLoader(train_set, shuffle=True, batch_size=args.batch_size, worker_init_fn=seed_worker, generator=g_cuda, num_workers=0, pin_memory=True)
-      dataloader_val   = DataLoader(val_set,   shuffle=True, batch_size=args.batch_size, worker_init_fn=seed_worker, generator=g_cuda, num_workers=0, pin_memory=True)
+      dataloader_val   = DataLoader(val_set,   shuffle=False, batch_size=args.batch_size, worker_init_fn=seed_worker, generator=g_cuda, num_workers=0, pin_memory=True)
 
     # Create logdir
     if ((not os.path.isdir(args.logdir)) and (rank == 0)):
@@ -245,7 +259,7 @@ class Engine(object):
 
     def load_data_compute_loss(self, data):
         # Move data to GPU
-        rgb = data['rgb'].to(self.device, dtype=torch.float32)
+        rgb = None if self.args.backbone == 'lidar_only' else data['rgb'].to(self.device, dtype=torch.float32)
         if self.config.multitask:
             depth = data['depth'].to(self.device, dtype=torch.float32)
             semantic = data['semantic'].squeeze(1).to(self.device, dtype=torch.long)
@@ -270,7 +284,7 @@ class Engine(object):
 
         ego_vel = data['speed'].to(self.device, dtype=torch.float32)
 
-        if ((self.args.backbone == 'transFuser') or (self.args.backbone == 'late_fusion') or (self.args.backbone == 'latentTF')):
+        if ((self.args.backbone == 'transFuser') or (self.args.backbone == 'late_fusion') or (self.args.backbone == 'latentTF') or (self.args.backbone == 'lidar_only')):
             losses = self.model(rgb, lidar, ego_waypoint=ego_waypoint, target_point=target_point,
                            target_point_image=target_point_image,
                            ego_vel=ego_vel.reshape(-1, 1), bev=bev,
@@ -287,7 +301,7 @@ class Engine(object):
                            depth=depth, semantic=semantic, num_points=num_points,
                            bev_points=bev_points, cam_points=cam_points)
         else:
-            raise ("The chosen vision backbone does not exist. The options are: transFuser, late_fusion, geometric_fusion, latentTF")
+            raise ("The chosen vision backbone does not exist. The options are: transFuser, late_fusion, geometric_fusion, latentTF, lidar_only")
 
         return losses
 

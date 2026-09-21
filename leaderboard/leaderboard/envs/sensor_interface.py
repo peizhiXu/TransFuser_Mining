@@ -122,7 +122,15 @@ class SpeedometerReader(BaseReader):
                 time.sleep(0.2)
                 continue
 
-        return {'speed': self._get_forward_speed(transform=transform, velocity=velocity)}
+        # ``pitch`` is exposed together with speed so mining-truck controllers
+        # can compensate gravity on long grades.  This does not add a sensor:
+        # the pseudo speedometer already reads the same vehicle transform to
+        # project velocity onto the vehicle's forward axis.
+        return {
+            'speed': self._get_forward_speed(
+                transform=transform, velocity=velocity),
+            'pitch': float(transform.rotation.pitch),
+        }
 
 
 class OpenDriveMapReader(BaseReader):
@@ -221,6 +229,13 @@ class SensorInterface(object):
             raise SensorConfigurationInvalid("The sensor with tag [{}] has not been created!".format(tag))
 
         self._new_data_buffers.put((tag, timestamp, data))
+
+    def clear(self):
+        """Release sensor actors and queued frame arrays between routes."""
+        self._sensors_objects.clear()
+        self._data_buffers.clear()
+        self._new_data_buffers = Queue()
+        self._opendrive_tag = None
 
     def get_data(self):
         try: 

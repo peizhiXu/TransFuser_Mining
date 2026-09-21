@@ -1,0 +1,107 @@
+<?xml version='1.0' encoding='utf-8'?>
+<routes>
+  <route id="0" town="0325_4">
+    <weather cloudiness="10.000000" fog_density="0.000000" fog_distance="100000.000000" fog_falloff="0.000000" id="ClearTwilight" precipitation="0.000000" precipitation_deposits="0.000000" sun_altitude_angle="-1.000000" sun_azimuth_angle="240.000000" wetness="0.000000" wind_intensity="5.000000">
+      <waypoint x="-349.3612365722656" y="-394.1151123046875" yaw="265.66009521484375" z="0.0" />
+      <waypoint x="-260.91412353515625" y="-312.5091552734375" yaw="196.36058044433594" z="0.0" />
+    </weather>
+  </route>
+  <route id="1" town="0325_4">
+    <weather cloudiness="10.000000" fog_density="0.000000" fog_distance="100000.000000" fog_falloff="0.000000" id="ClearTwilight" precipitation="0.000000" precipitation_deposits="0.000000" sun_altitude_angle="-1.000000" sun_azimuth_angle="240.000000" wetness="0.000000" wind_intensity="5.000000">
+      <waypoint x="-614.58837890625" y="131.45535278320312" yaw="136.97557067871094" z="90.0" />
+      <waypoint x="-627.7534790039062" y="143.742431640625" yaw="136.97557067871094" z="90.0" />
+      <waypoint x="-647.7135009765625" y="161.9643096923828" yaw="140.68408203125" z="90.0" />
+      <waypoint x="-726.0323486328125" y="289.79669189453125" yaw="41.78872299194336" z="89.99998474121094" />
+    </weather>
+  </route>
+  <route id="2" town="0325_4">
+    <weather cloudiness="10.000000" fog_density="0.000000" fog_distance="100000.000000" fog_falloff="0.000000" id="ClearTwilight" precipitation="0.000000" precipitation_deposits="0.000000" sun_altitude_angle="-1.000000" sun_azimuth_angle="240.000000" wetness="0.000000" wind_intensity="5.000000">
+      <waypoint x="-744.0342407226562" y="264.96636962890625" yaw="69.61116790771484" z="90.0" />
+      <waypoint x="-596.5198974609375" y="301.2642822265625" yaw="-44.08317565917969" z="89.99996948242188" />
+      <waypoint x="-604.0599975585938" y="205.51068115234375" yaw="-117.04615783691406" z="89.99996948242188" />
+      <waypoint x="-604.8126220703125" y="142.84954833984375" yaw="316.9755859375" z="90.0" />
+    </weather>
+  </route>
+  <route id="3" town="0325_4">
+    <weather cloudiness="10.000000" fog_density="0.000000" fog_distance="100000.000000" fog_falloff="0.000000" id="ClearTwilight" precipitation="0.000000" precipitation_deposits="0.000000" sun_altitude_angle="-1.000000" sun_azimuth_angle="240.000000" wetness="0.000000" wind_intensity="5.000000">
+      <waypoint x="-615.60888671875" y="132.4077606201172" yaw="136.97557067871094" z="90.0" />
+      <waypoint x="-625.2890625" y="141.44235229492188" yaw="136.97557067871094" z="90.0" />
+      <waypoint x="-615.5880126953125" y="215.9189453125" yaw="62.95384216308594" z="89.99996948242188" />
+      <waypoint x="-645.84619140625" y="304.0544738769531" yaw="193.07627868652344" z="89.99996948242188" />
+    </weather>
+  </route>
+  <route id="4" town="0325_4">
+    <weather cloudiness="10.000000" fog_density="0.000000" fog_distance="100000.000000" fog_falloff="0.000000" id="ClearTwilight" precipitation="0.000000" precipitation_deposits="0.000000" sun_altitude_angle="-1.000000" sun_azimuth_angle="240.000000" wetness="0.000000" wind_intensity="5.000000">
+      <waypoint x="-718.4613647460938" y="276.2704772949219" yaw="226.22430419921875" z="89.99998474121094" />
+      <waypoint x="-682.46923828125" y="202.98135375976562" yaw="327.351318359375" z="90.0" />
+      <waypoint x="-650.58984375" y="182.7323760986328" yaw="326.302734375" z="90.0" />
+      <waypoint x="-638.4598388671875" y="173.77377319335938" yaw="320.80194091796875" z="90.0" />
+      <waypoint x="-606.306884765625" y="144.244140625" yaw="316.9755859375" z="90.0" />
+    </weather>
+  </route>
+  <route id="5" town="0325_4">
+    <weather cloudiness="10.000000" fog_density="0.000000" fog_distance="100000.000000" fog_falloff="0.000000" id="ClearTwilight" precipitation="0.000000" precipitation_deposits="0.000000" sun_altitude_angle="-1.000000" sun_azimuth_angle="240.000000" wetness="0.000000" wind_intensity="5.000000">
+      <waypoint x="249.065567" y="97.996323" yaw="277.152985" z="175.000000" />
+      <waypoint x="255.849289" y="52.734238" yaw="278.917480" z="175.000000" />
+      <waypoint x="257.974396" y="39.606514" yaw="280.118927" z="175.000000" />
+      <waypoint x="283.492462" y="-65.285912" yaw="277.295013" z="175.000000" />
+      <waypoint x="285.039398" y="-81.711449" yaw="273.465393" z="175.000000" />
+      <waypoint x="301.664429" y="-181.998871" yaw="-67.860748" z="177.464554" />
+    </weather>
+  </route>
+  <route id="6" town="0325_4">
+    <weather cloudiness="10.000000" fog_density="0.000000" fog_distance="100000.000000" fog_falloff="0.000000" id="ClearTwilight" precipitation="0.000000" precipitation_deposits="0.000000" sun_altitude_angle="-1.000000" sun_azimuth_angle="240.000000" wetness="0.000000" wind_intensity="5.000000">
+      <waypoint x="312.519806" y="-284.378754" yaw="267.098297" z="171.160034" />
+      <waypoint x="305.497803" y="-376.772919" yaw="260.168213" z="164.158737" />
+      <waypoint x="271.907898" y="-472.444214" yaw="242.749390" z="156.768478" />
+      <waypoint x="215.195160" y="-564.121338" yaw="226.878845" z="148.833679" />
+      <waypoint x="95.855789" y="-641.353455" yaw="204.021698" z="138.251068" />
+      <waypoint x="-17.621693" y="-679.570557" yaw="196.797302" z="128.775940" />
+      <waypoint x="-150.939957" y="-702.722412" yaw="178.963272" z="118.328995" />
+      <waypoint x="-277.599792" y="-680.941101" yaw="166.678482" z="108.286972" />
+      <waypoint x="-453.510040" y="-565.130188" yaw="132.241684" z="97.471603" />
+      <waypoint x="-550.014832" y="-433.789062" yaw="121.712219" z="96.384605" />
+    </weather>
+  </route>
+  <route id="7" town="0325_4">
+    <weather cloudiness="10.000000" fog_density="0.000000" fog_distance="100000.000000" fog_falloff="0.000000" id="ClearTwilight" precipitation="0.000000" precipitation_deposits="0.000000" sun_altitude_angle="-1.000000" sun_azimuth_angle="240.000000" wetness="0.000000" wind_intensity="5.000000">
+      <waypoint x="-587.210205078125" y="-367.1831359863281" yaw="118.53018188476562" z="95.87154388427734" />
+      <waypoint x="-624.5885620117188" y="-267.775390625" yaw="96.51949310302734" z="95.1994857788086" />
+      <waypoint x="-629.4239501953125" y="-204.162353515625" yaw="93.5876693725586" z="94.77120208740234" />
+      <waypoint x="-630.507080078125" y="-186.55763244628906" yaw="93.51964569091797" z="94.65080261230469" />
+      <waypoint x="-624.76806640625" y="-99.93397521972656" yaw="78.53487396240234" z="94.23189544677734" />
+    </weather>
+  </route>
+  <route id="8" town="0325_4">
+    <weather cloudiness="10.000000" fog_density="0.000000" fog_distance="100000.000000" fog_falloff="0.000000" id="ClearTwilight" precipitation="0.000000" precipitation_deposits="0.000000" sun_altitude_angle="-1.000000" sun_azimuth_angle="240.000000" wetness="0.000000" wind_intensity="5.000000">
+      <waypoint x="-610.6326293945312" y="-255.1272430419922" yaw="94.24708557128906" z="95.12641143798828" />
+      <waypoint x="-614.4053955078125" y="-203.9793243408203" yaw="93.67314910888672" z="94.77630615234375" />
+      <waypoint x="-606.9542236328125" y="9.88484001159668" yaw="82.42869567871094" z="92.76859283447266" />
+    </weather>
+  </route>
+  <route id="9" town="0325_4">
+    <weather cloudiness="10.000000" fog_density="0.000000" fog_distance="100000.000000" fog_falloff="0.000000" id="ClearTwilight" precipitation="0.000000" precipitation_deposits="0.000000" sun_altitude_angle="-1.000000" sun_azimuth_angle="240.000000" wetness="0.000000" wind_intensity="5.000000">
+      <waypoint x="-627.76806640625" y="-226.92807006835938" yaw="94.24708557128906" z="94.92548370361328" />
+      <waypoint x="-629.4924926757812" y="-203.05470275878906" yaw="93.51964569091797" z="94.76380157470703" />
+      <waypoint x="-630.4410400390625" y="-187.63128662109375" yaw="93.51964569091797" z="94.65815734863281" />
+      <waypoint x="-630.3289794921875" y="-140.05870056152344" yaw="85.68456268310547" z="94.34500885009766" />
+      <waypoint x="-618.08935546875" y="-67.5390396118164" yaw="79.08848571777344" z="94.12989807128906" />
+      <waypoint x="-606.5422973632812" y="13.001319885253906" yaw="82.57799530029297" z="92.7099838256836" />
+    </weather>
+  </route>
+  <route id="10" town="0325_4">
+    <weather cloudiness="10.000000" fog_density="0.000000" fog_distance="100000.000000" fog_falloff="0.000000" id="ClearTwilight" precipitation="0.000000" precipitation_deposits="0.000000" sun_altitude_angle="-1.000000" sun_azimuth_angle="240.000000" wetness="0.000000" wind_intensity="5.000000">
+      <waypoint x="-603.385986328125" y="40.71617889404297" yaw="83.96597290039062" z="92.04283142089844" />
+      <waypoint x="-601.0382690429688" y="71.35175323486328" yaw="86.58841705322266" z="90.96210479736328" />
+      <waypoint x="-600.1395874023438" y="89.44772338867188" yaw="88.8067398071289" z="90.29505157470703" />
+      <waypoint x="-614.555419921875" y="131.42459106445312" yaw="136.97557067871094" z="90.0" />
+    </weather>
+  </route>
+  <route id="11" town="0325_4">
+    <weather cloudiness="10.000000" fog_density="0.000000" fog_distance="100000.000000" fog_falloff="0.000000" id="ClearTwilight" precipitation="0.000000" precipitation_deposits="0.000000" sun_altitude_angle="-1.000000" sun_azimuth_angle="240.000000" wetness="0.000000" wind_intensity="5.000000">
+      <waypoint x="-605.6087036132812" y="143.59249877929688" yaw="316.9755859375" z="90.0" />
+      <waypoint x="-597.5865478515625" y="136.36009216308594" yaw="-35.7657470703125" z="90.0" />
+      <waypoint x="-409.757568359375" y="145.26556396484375" yaw="357.6492919921875" z="85.35089874267578" />
+    </weather>
+  </route>
+</routes>

@@ -31,9 +31,16 @@ class CARLA_Data(Dataset):
         self.use_point_pillars = np.array(config.use_point_pillars)
         self.max_lidar_points = np.array(config.max_lidar_points)
         self.backbone = np.array(config.backbone).astype(np.string_)
+        self.lidar_only = config.backbone == 'lidar_only'
         self.inv_augment_prob = np.array(config.inv_augment_prob)
         
         self.converter = np.uint8(config.converter)
+
+        # Needed by lidar_to_histogram_features and lidar_bev_cam_correspondences.
+        # Kept as plain arrays like the fields above so DataLoader workers do not
+        # have to pickle the config object.
+        self.lidar_pos = np.array(config.lidar_pos, dtype=np.float32)
+        self.camera_pos = np.array(config.camera_pos, dtype=np.float32)
 
         self.images = []
         self.bevs = []
@@ -146,9 +153,12 @@ class CARLA_Data(Dataset):
         for i in range(self.seq_len):
             if not self.data_cache is None and str(measurements[i], encoding='utf-8') in self.data_cache:
                     measurements_i, images_i, lidars_i, lidars_raw_i, bevs_i, depths_i, semantics_i = self.data_cache[str(measurements[i], encoding='utf-8')]
-                    images_i = cv2.imdecode(images_i, cv2.IMREAD_UNCHANGED)
-                    depths_i = cv2.imdecode(depths_i, cv2.IMREAD_UNCHANGED)
-                    semantics_i = cv2.imdecode(semantics_i, cv2.IMREAD_UNCHANGED)
+                    if images_i is not None:
+                        images_i = cv2.imdecode(images_i, cv2.IMREAD_UNCHANGED)
+                    if depths_i is not None:
+                        depths_i = cv2.imdecode(depths_i, cv2.IMREAD_UNCHANGED)
+                    if semantics_i is not None:
+                        semantics_i = cv2.imdecode(semantics_i, cv2.IMREAD_UNCHANGED)
                     bevs_i.seek(0) # Set the point to the start of the file like object
                     bevs_i = np.load(bevs_i)['arr_0']
             else:
@@ -162,10 +172,13 @@ class CARLA_Data(Dataset):
                     lidars_raw_i = None
                 lidars_i[:, 1] *= -1
 
-                images_i = cv2.imread(str(images[i], encoding='utf-8'), cv2.IMREAD_COLOR)
-                if(images_i is None):
-                    print("Error loading file: ", str(images[i], encoding='utf-8'))
-                images_i = scale_image_cv2(cv2.cvtColor(images_i, cv2.COLOR_BGR2RGB), self.scale)
+                if self.lidar_only:
+                    images_i = None
+                else:
+                    images_i = cv2.imread(str(images[i], encoding='utf-8'), cv2.IMREAD_COLOR)
+                    if(images_i is None):
+                        raise FileNotFoundError(str(images[i], encoding='utf-8'))
+                    images_i = scale_image_cv2(cv2.cvtColor(images_i, cv2.COLOR_BGR2RGB), self.scale)
 
                 bev_array = cv2.imread(str(bevs[i], encoding='utf-8'), cv2.IMREAD_UNCHANGED)
                 bev_array = cv2.cvtColor(bev_array, cv2.COLOR_BGR2RGB)
@@ -189,9 +202,9 @@ class CARLA_Data(Dataset):
 
                 if not self.data_cache is None:
                     # We want to cache the images in png format instead of uncompressed, to reduce memory usage
-                    result, compressed_imgage = cv2.imencode('.png', images_i)
-                    result, compressed_depths = cv2.imencode('.png', depths_i)
-                    result, compressed_semantics = cv2.imencode('.png', semantics_i)
+                    compressed_imgage = cv2.imencode('.png', images_i)[1] if images_i is not None else None
+                    compressed_depths = cv2.imencode('.png', depths_i)[1] if depths_i is not None else None
+                    compressed_semantics = cv2.imencode('.png', semantics_i)[1] if semantics_i is not None else None
                     compressed_bevs = io.BytesIO()  # bev has 2 channels which does not work with png compression so we use generic numpy in memory compression
                     np.savez_compressed(compressed_bevs, bevs_i)
                     self.data_cache[str(measurements[i], encoding='utf-8')] = (measurements_i, compressed_imgage, lidars_i, lidars_raw_i, compressed_bevs, compressed_depths, compressed_semantics)
@@ -219,12 +232,14 @@ class CARLA_Data(Dataset):
             rad = np.deg2rad(degree)
             crop_shift = degree / 60 * self.img_width / self.scale # we scale first
 
-        images_i = loaded_images[self.seq_len-1]
-        images_i = crop_image_cv2(images_i, crop=self.img_resolution, crop_shift=crop_shift)
+        if not self.lidar_only:
+            images_i = loaded_images[self.seq_len-1]
+            images_i = crop_image_cv2(images_i, crop=self.img_resolution, crop_shift=crop_shift)
+            data['rgb'] = images_i
 
-        bevs_i = load_crop_bev_npy(loaded_bevs[self.seq_len-1], degree)
+        bevs_i = load_crop_bev_npy(
+            loaded_bevs[self.seq_len-1], degree, lidar_x=self.lidar_pos[0])
         
-        data['rgb'] = images_i
         data['bev'] = bevs_i
 
         if self.multitask:
@@ -247,8 +262,10 @@ class CARLA_Data(Dataset):
         for i in range(self.seq_len):
             lidar = loaded_lidars[i]
             # transform lidar to lidar seq-1
-            lidar = align(lidar, measurements[i], measurements[self.seq_len-1], degree=degree)
-            lidar_bev = lidar_to_histogram_features(lidar)
+            lidar = align(
+                lidar, measurements[i], measurements[self.seq_len-1],
+                degree=degree, lidar_pos=self.lidar_pos)
+            lidar_bev = lidar_to_histogram_features(lidar, lidar_z=self.lidar_pos[2])
             lidars.append(lidar_bev)
 
             if (backbone == 'geometric_fusion'):
@@ -259,7 +276,9 @@ class CARLA_Data(Dataset):
             if (self.use_point_pillars == True):
                 # We want to align the LiDAR for the point pillars, but not voxelize them
                 lidar_pillar = deepcopy(loaded_lidars[i])
-                lidar_pillar = align(lidar_pillar, measurements[i], measurements[self.seq_len-1], degree=degree)
+                lidar_pillar = align(
+                    lidar_pillar, measurements[i], measurements[self.seq_len-1],
+                    degree=degree, lidar_pos=self.lidar_pos)
                 lidars_pillar.append(lidar_pillar)
 
         # NOTE: This flips the ordering of the LiDARs since we only use 1 it does nothing. Can potentially be removed.
@@ -270,7 +289,9 @@ class CARLA_Data(Dataset):
             lidars_pillar = np.concatenate(lidars_pillar[::-1], axis=0)
 
         if (backbone == 'geometric_fusion'):
-            curr_bev_points, curr_cam_points = lidar_bev_cam_correspondences(deepcopy(lidars_raw), debug=False)
+            curr_bev_points, curr_cam_points = lidar_bev_cam_correspondences(
+                deepcopy(lidars_raw), debug=False,
+                cam_z=self.camera_pos[2], lidar_z=self.lidar_pos[2])
 
 
         # ego car is always the first one in label file
@@ -279,7 +300,7 @@ class CARLA_Data(Dataset):
         # only use label of frame 1
         bboxes = parse_labels(labels[self.seq_len-1], rad=-rad)
         waypoints = get_waypoints(labels[self.seq_len-1:], self.pred_len+1)
-        waypoints = transform_waypoints(waypoints)
+        waypoints = transform_waypoints(waypoints, lidar_pos=self.lidar_pos)
 
         # save waypoints in meters
         filtered_waypoints = []
@@ -352,7 +373,8 @@ class CARLA_Data(Dataset):
 
         data['target_point'] = local_command_point
         
-        data['target_point_image'] = draw_target_point(local_command_point)
+        data['target_point_image'] = draw_target_point(
+            local_command_point, lidar_x=self.lidar_pos[0])
         return data
 
 def get_depth(data):
@@ -362,12 +384,19 @@ def get_depth(data):
     data = np.transpose(data, (1,2,0))
     data = data.astype(np.float32)
 
-    normalized = np.dot(data, [65536.0, 256.0, 1.0]) 
+    normalized = np.dot(data, [65536.0, 256.0, 1.0])
     normalized /=  (256 * 256 * 256 - 1)
     # in_meters = 1000 * normalized
-    #clip to 50 meters
-    normalized = np.clip(normalized, a_min=0.0, a_max=0.05)
-    normalized = normalized * 20.0 # Rescale map to lie in [0,1]
+    # Upstream clipped to 50m for the Lincoln MKZ's urban street scenes. The
+    # open-pit mine has much longer sightlines: a 25-route sample of the
+    # collected depth frames showed the median non-sky pixel is already
+    # ~47m away, so a 50m clip flattened roughly half of the "real" scene to
+    # the same saturated value. 100m covers ~69% of that sample's non-sky
+    # pixels (vs 52% at 50m) while keeping twice the near-field precision of
+    # a 200m clip, which matters more for near-term driving decisions than
+    # resolving the far pit walls/horizon.
+    normalized = np.clip(normalized, a_min=0.0, a_max=0.1)
+    normalized = normalized * 10.0 # Rescale map to lie in [0,1]
 
     return normalized
 
@@ -394,10 +423,10 @@ def get_waypoints(labels, len_labels):
 
 # this is only for visualization, For training, we should use vehicle coordinate
 
-def transform_waypoints(waypoints):
+def transform_waypoints(waypoints, lidar_pos):
     """transform waypoints to be origin at ego_matrix"""
 
-    T = get_vehicle_to_virtual_lidar_transform()
+    T = get_vehicle_to_virtual_lidar_transform(lidar_pos)
     
     for k in waypoints.keys():
         vehicle_matrix = np.array(waypoints[k][0][0])
@@ -408,7 +437,9 @@ def transform_waypoints(waypoints):
             
     return waypoints
 
-def align(lidar_0, measurements_0, measurements_1, degree=0):
+def align(lidar_0, measurements_0, measurements_1, degree=0, lidar_pos=None):
+    if lidar_pos is None:
+        raise ValueError('align requires the configured LiDAR mounting position')
     
     matrix_0 = measurements_0['ego_matrix']
     matrix_1 = measurements_1['ego_matrix']
@@ -416,8 +447,8 @@ def align(lidar_0, measurements_0, measurements_1, degree=0):
     matrix_0 = np.array(matrix_0)
     matrix_1 = np.array(matrix_1)
    
-    Tr_lidar_to_vehicle = get_lidar_to_vehicle_transform()
-    Tr_vehicle_to_lidar = get_vehicle_to_lidar_transform()
+    Tr_lidar_to_vehicle = get_lidar_to_vehicle_transform(lidar_pos)
+    Tr_vehicle_to_lidar = get_vehicle_to_lidar_transform(lidar_pos)
 
     transform_0_to_1 = Tr_vehicle_to_lidar @ np.linalg.inv(matrix_1) @ matrix_0 @ Tr_lidar_to_vehicle
 
@@ -443,9 +474,23 @@ def align(lidar_0, measurements_0, measurements_1, degree=0):
     return lidar
 
 
-def lidar_to_histogram_features(lidar):
+# A point this far above the road still counts as ground. The two histogram
+# bins are "road surface" and "everything standing on it", so the split has to
+# follow the LiDAR mounting height: it is expressed in the LiDAR frame, where
+# the road sits at -lidar_z.
+GROUND_CLEARANCE_M = 0.2
+
+
+def lidar_to_histogram_features(lidar, lidar_z=2.5):
     """
     Convert LiDAR point cloud into 2-bin histogram over 256x256 grid
+
+    lidar_z: LiDAR mounting height in metres, used to place the ground/obstacle
+        split. The 2.5 m default reproduces the upstream Lincoln MKZ threshold
+        of -2.3. Passing the wrong height silently ruins both bins: on the
+        43 t mining truck (4.8 m mount) the upstream value put everything below
+        2.5 m of height into the road bin, which cost the obstacle bin about a
+        third of its points.
     """
     def splat_points(point_cloud):
         # 256 x 256 grid
@@ -460,8 +505,9 @@ def lidar_to_histogram_features(lidar):
         overhead_splat = hist/hist_max_per_pixel
         return overhead_splat
 
-    below = lidar[lidar[...,2]<=-2.3]
-    above = lidar[lidar[...,2]>-2.3]
+    ground_split = -(float(lidar_z) - GROUND_CLEARANCE_M)
+    below = lidar[lidar[...,2]<=ground_split]
+    above = lidar[lidar[...,2]>ground_split]
     below_features = splat_points(below)
     above_features = splat_points(above)
     features = np.stack([above_features, below_features], axis=-1)
@@ -583,7 +629,7 @@ def crop_seg(image, crop=(128, 640), crop_shift=0):
     cropped_image = image[start_y:start_y+crop_h, start_x:start_x+crop_w]
     return cropped_image
 
-def load_crop_bev_npy(bev_array, degree):
+def load_crop_bev_npy(bev_array, degree, lidar_x):
     """
     Load and crop an Image.
     Crop depends on augmentation angle.
@@ -593,10 +639,17 @@ def load_crop_bev_npy(bev_array, degree):
     start_x = 250 - PIXLES // 2
     start_y = 250 - PIXLES
 
-    # shift the center by 7 because the lidar is + 1.3 in x 
+    # The top-down labels are centered on the vehicle while the network BEV is
+    # centered on the LiDAR. Convert the forward mounting offset to pixels.
     bev_array = np.moveaxis(bev_array, 0, -1).astype(np.float32)
     bev_shift = np.zeros_like(bev_array)
-    bev_shift[7:] = bev_array[:-7]
+    shift_pixels = int(np.floor(float(lidar_x) * PIXELS_PER_METER_FOR_BEV + 0.5))
+    if shift_pixels > 0:
+        bev_shift[shift_pixels:] = bev_array[:-shift_pixels]
+    elif shift_pixels < 0:
+        bev_shift[:shift_pixels] = bev_array[-shift_pixels:]
+    else:
+        bev_shift[:] = bev_array
 
     bev_shift = rotate(bev_shift, degree)
     cropped_image = bev_shift[start_y:start_y+PIXLES, start_x:start_x+PIXLES]
@@ -613,12 +666,12 @@ def load_crop_bev_npy(bev_array, degree):
 
 
 
-def draw_target_point(target_point, color = (255, 255, 255)):
+def draw_target_point(target_point, color=(255, 255, 255), lidar_x=1.3):
     image = np.zeros((256, 256), dtype=np.uint8)
     target_point = target_point.copy()
 
     # convert to lidar coordinate
-    target_point[1] += 1.3
+    target_point[1] += float(lidar_x)
     point = target_point * 8.
     point[1] *= -1
     point[1] = 256 - point[1] 
@@ -672,7 +725,8 @@ def correspondences_at_one_scale(valid_bev_points, valid_cam_points, lidar_x, li
 
     return cam_to_bev_proj_locs, bev_to_cam_proj_locs
 
-def lidar_bev_cam_correspondences(world, lidar_vis=None, image_vis=None, step=None, debug=False):
+def lidar_bev_cam_correspondences(world, lidar_vis=None, image_vis=None, step=None, debug=False,
+                                  cam_z=2.3, lidar_z=2.5):
     """
     Convert LiDAR point cloud to camera co-ordinates
 
@@ -705,8 +759,12 @@ def lidar_bev_cam_correspondences(world, lidar_vis=None, image_vis=None, step=No
     focal_x = img_width  / (2.0 * np.tan(np.deg2rad(fov_width)  / 2.0))
     focal_y = img_height / (2.0 * np.tan(np.deg2rad(fov_height) / 2.0))
 
-    cam_z   = 2.3
-    lidar_z = 2.5
+    # Only the difference matters here: the point cloud is lifted into the
+    # camera's height. The 2.3/2.5 defaults are the upstream Lincoln MKZ mounts;
+    # callers pass the real ones from GlobalConfig. On the mining truck both
+    # sensors sit at the same point, so the shift is zero.
+    cam_z   = float(cam_z)
+    lidar_z = float(lidar_z)
 
     # get valid points in 64x64 grid
     world[:, 0] *= -1  # flip x axis, so that the positive direction points towards right. new coordinate system: x right, y forward, z up

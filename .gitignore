@@ -162,3 +162,10 @@ cython_debug/
 results/
 model_ckpt/
 data/
+# The mining routes and scenario definitions are inputs, not generated data.
+# The blanket "data/" rule above hides them. Git will not descend into an
+# excluded directory, so each parent has to be re-included before the
+# contents can be. Everything else under leaderboard/data stays ignored.
+!leaderboard/data/
+leaderboard/data/*
+!leaderboard/data/mining/

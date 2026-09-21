@@ -14,13 +14,26 @@ class GlobalConfig:
     lidar_resolution_width  = 256 # Width of the LiDAR grid that the point cloud is voxelized into.
     lidar_resolution_height = 256 # Height of the LiDAR grid that the point cloud is voxelized into.
     pixels_per_meter = 8.0 # How many pixels make up 1 meter. 1 / pixels_per_meter = size of pixel in meters
-    lidar_pos = [1.3,0.0,2.5] # x, y, z mounting position of the LiDAR
+    # Mounting positions for the Komatsu HD465-7E0 mining truck. Upstream used
+    # [1.3, 0.0, 2.5] and [1.3, 0.0, 2.3] for the Lincoln MKZ. The truck is
+    # 9.40 m long and 4.52 m tall, so the sedan mount sits inside its body.
+    # These values are the ones team_code_autopilot/data_agent_mine.py collects
+    # with; they are also what submission_agent.py mounts at deployment, so the
+    # two must not drift apart. Checked on 0325_5: no self-occlusion, nearest
+    # LiDAR return 9.6 m, no returns within 5 m.
+    lidar_pos = [3.5, 0.0, 4.8] # x, y, z mounting position of the LiDAR
     lidar_rot = [0.0, 0.0, -90.0] # Roll Pitch Yaw of LiDAR in degree
 
-    camera_pos = [1.3, 0.0, 2.3] #x, y, z mounting position of the camera
-    camera_width = 960 # Camera width in pixel
-    camera_height = 480 # Camera height in pixel
-    camera_fov = 120 #Camera FOV in degree
+    camera_pos = [3.5, 0.0, 4.8] #x, y, z mounting position of the camera
+    # Closed-loop inference captures a wide 960x480/120-degree image from each
+    # camera and crops its central 320x160 area. That crop has a 60-degree
+    # horizontal FOV and therefore matches the lower-cost collection cameras.
+    camera_width = 960 # Raw online camera width in pixels
+    camera_height = 480 # Raw online camera height in pixels
+    camera_fov = 120 # Raw online camera horizontal FOV in degrees
+    camera_crop_width = 320 # Per-camera image passed to the panorama
+    camera_crop_height = 160
+    camera_crop_fov = 60 # Effective FOV after the central crop
     camera_rot_0 = [0.0, 0.0, 0.0] # Roll Pitch Yaw of camera 0 in degree
     camera_rot_1 = [0.0, 0.0, -60.0] # Roll Pitch Yaw of camera 1 in degree
     camera_rot_2 = [0.0, 0.0, 60.0] # Roll Pitch Yaw of camera 2 in degree
@@ -154,22 +167,35 @@ class GlobalConfig:
     route_planner_min_distance = 7.5
     route_planner_max_distance = 50.0
     action_repeat = 2 # Number of times we repeat the networks action. It's 2 because the LiDAR operates at half the frame rate of the simulation
-    stuck_threshold = 1100/action_repeat # Number of frames after which the creep controller starts triggering. Divided by
-    creep_duration = 30 / action_repeat # Number of frames we will creep forward
+    # Recovery timing is expressed in simulator frames and converted to the
+    # 10 Hz inference loop.  The upstream agent waited 55 s, crept for only
+    # 1.5 s and could never retry after a failed attempt.  A loaded HD465 needs
+    # a longer launch window, especially on the 10--16% grades in this set.
+    stuck_threshold = 200 // action_repeat       # 10 s before first attempt
+    creep_duration = 60 // action_repeat         # 3 s per attempt
+    stuck_retry_delay = 100 // action_repeat     # 5 s between attempts
+    max_recovery_attempts = 3
+    stuck_speed_threshold = 0.1
+    stuck_release_speed = 0.5
 
-    # Size of the safety box
-    safety_box_z_min = -2.0
-    safety_box_z_max = -1.05
+    # HD465 dimensions and the LiDAR-frame region checked while the stuck
+    # recovery controller tries to creep forward. Coordinates follow the
+    # TransFuser LiDAR convention: x is lateral and negative y is forward.
+    # Ignore the road plane.  With a 4.8 m LiDAR, a 16% uphill can rise to
+    # roughly z=-3.5 m at 8 m range; the former -4.6 m lower bound classified
+    # that road surface as an obstacle and cancelled every recovery attempt.
+    safety_box_z_min = -3.0
+    safety_box_z_max = 0.5
 
-    safety_box_y_min = -3.0
-    safety_box_y_max = 0.0
+    safety_box_y_min = -8.0
+    safety_box_y_max = -1.0
 
-    safety_box_x_min = -1.066
-    safety_box_x_max = 1.066
+    safety_box_x_min = -2.8
+    safety_box_x_max = 2.8
 
-    ego_extent_x = 2.4508416652679443 # Half the length of the ego car in x direction
-    ego_extent_y = 1.0641621351242065 # Half the length of the ego car in x direction
-    ego_extent_z = 0.7553732395172119 # Half the length of the ego car in x direction
+    ego_extent_x = 4.698465 # Half the HD465 length in x direction
+    ego_extent_y = 2.682265 # Half the HD465 width in y direction
+    ego_extent_z = 2.261520 # Half the HD465 height in z direction
 
 	# GPT Encoder
     n_embd = 512
@@ -190,9 +216,16 @@ class GlobalConfig:
     turn_KD = 0.3
     turn_n = 20 # buffer size
 
-    speed_KP = 5.0
-    speed_KI = 0.5
-    speed_KD = 1.0
+    # Speed PID and clip values below match team_code_autopilot/autopilot_mine.py's
+    # override for the HD465 (heavier, slower-responding than the Lincoln MKZ
+    # these were originally tuned for). turn_KP/KI/KD above are left at the
+    # upstream values because autopilot_mine.py never overrides the steering
+    # controller. Deployment (submission_agent.py) builds its PID controllers
+    # straight from this config (model.py:608-609), so a mismatch here would
+    # only surface at closed-loop time, not during training.
+    speed_KP = 0.28
+    speed_KI = 0.12
+    speed_KD = 0.04
     speed_n = 20 # buffer size
 
     default_speed = 4.0 # Speed used when creeping
@@ -200,8 +233,18 @@ class GlobalConfig:
     max_throttle = 0.75 # upper limit on throttle signal value in dataset
     brake_speed = 0.4 # desired speed below which brake is triggered
     brake_ratio = 1.1 # ratio of speed to desired speed at which brake is triggered
-    clip_delta = 0.25 # maximum change in speed input to logitudinal controller
-    clip_throttle = 0.75 # Maximum throttle allowed by the controller
+    clip_delta = 1.5 # maximum change in speed input to logitudinal controller
+    clip_throttle = 1.0 # Maximum throttle allowed by the controller
+
+    # Longitudinal feed-forward and service-brake values mirror the mining
+    # expert.  They are deployment controller parameters, not learned weights.
+    cruise_feed_forward = 0.12
+    uphill_feed_forward_gain = 5.8
+    service_brake_gain = 0.22
+    service_brake_deadband = 0.25
+    max_service_brake = 0.65
+    downhill_brake_gain = 3.2
+    max_downhill_brake = 0.60
 
     def __init__(self, root_dir='', setting='all', **kwargs):
         self.root_dir = root_dir
@@ -241,6 +284,18 @@ class GlobalConfig:
                     if not os.path.isfile(os.path.join(self.root_dir, file)):
                         print("Val Folder: ", file)
                         self.val_data.append(os.path.join(self.root_dir, town, file))
+        elif (setting == 'mining'):
+            # Explicit route-level split: root_dir/train and root_dir/val.
+            train_root = os.path.join(self.root_dir, 'train')
+            val_root = os.path.join(self.root_dir, 'val')
+            if not os.path.isdir(train_root) or not os.path.isdir(val_root):
+                raise ValueError(
+                    'Mining setting expects train and val directories under: %s'
+                    % self.root_dir)
+            self.train_towns = ['train']
+            self.val_towns = ['val']
+            self.train_data = [train_root]
+            self.val_data = [val_root]
         elif (setting == 'eval'): #No training data needed during evaluation.
             pass
         else:

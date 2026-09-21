@@ -11,8 +11,8 @@ PIXELS_PER_METER = 5
 
 
 class Renderer():
-    def __init__(self, map_offset, map_dims, data_generation=True):
-        self.args = {'device': 'cuda'}
+    def __init__(self, map_offset, map_dims, data_generation=True, device='cuda'):
+        self.args = {'device': device}
         if data_generation:
             self.PIXELS_AHEAD_VEHICLE = 0 # ego car is central
             self.local_view_dims = (500, 500)

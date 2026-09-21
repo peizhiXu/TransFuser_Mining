@@ -1536,6 +1536,29 @@ class InRouteTest(Criterion):
                     closest_index = index
                     shortest_distance = distance
 
+            # The upstream criterion only looks five dense waypoints ahead.
+            # On the mining OpenDRIVE maps, overlapping roads and junctions can
+            # make that small monotonic window lose the correct route index.
+            # It then reports a >30 m deviation even while the vehicle center
+            # remains on the intended route. Keep the cheap local search for
+            # normal ticks, but recover against the full route before declaring
+            # a failure. This still rejects a vehicle farther than offroad_max
+            # from every point in the evaluated route.
+            if shortest_distance >= self._offroad_max:
+                recovery_distance = float('inf')
+                recovery_index = -1
+                for index, ref_waypoint in enumerate(self._waypoints):
+                    distance = math.sqrt(
+                        ((location.x - ref_waypoint.x) ** 2)
+                        + ((location.y - ref_waypoint.y) ** 2)
+                    )
+                    if distance <= recovery_distance:
+                        recovery_index = index
+                        recovery_distance = distance
+                if recovery_distance < shortest_distance:
+                    closest_index = recovery_index
+                    shortest_distance = recovery_distance
+
             if closest_index == -1 or shortest_distance == float('inf'):
                 return new_status
 

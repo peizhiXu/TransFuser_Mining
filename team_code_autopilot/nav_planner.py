@@ -10,6 +10,11 @@ from agents.navigation.global_route_planner_dao import GlobalRoutePlannerDAO
 
 DEBUG = False
 
+# Building GlobalRoutePlanner for a large mining OpenDRIVE map creates a very
+# large topology graph.  A Leaderboard batch has many routes on the same map,
+# so construct that immutable graph once and reuse it for route tracing.
+_GLOBAL_ROUTE_PLANNER_CACHE = {}
+
 
 class PIDController(object):
     def __init__(self, K_P=1.0, K_I=0.0, K_D=0.0, n=20):
@@ -188,7 +193,8 @@ class RoutePlanner(object):
         self.is_last = False
 
 
-def interpolate_trajectory(world_map, waypoints_trajectory, hop_resolution=1.0, max_len=100):
+def interpolate_trajectory(world_map, waypoints_trajectory, hop_resolution=1.0,
+                           max_len=100, planner_cache_key=None):
     """
     Given some raw keypoints interpolate a full dense trajectory to be used by the user.
     returns the full interpolated route both in GPS coordinates and also in its original form.
@@ -199,21 +205,50 @@ def interpolate_trajectory(world_map, waypoints_trajectory, hop_resolution=1.0, 
         - hop_resolution: is the resolution, how dense is the provided trajectory going to be made
     """
 
-    dao = GlobalRoutePlannerDAO(world_map, hop_resolution)
-    grp = GlobalRoutePlanner(dao)
-    grp.setup()
+    grp = None
+    if planner_cache_key is not None:
+        grp = _GLOBAL_ROUTE_PLANNER_CACHE.get(planner_cache_key)
+    if grp is None:
+        if planner_cache_key is not None:
+            print("Route-graph cache miss: building {} once".format(
+                planner_cache_key), flush=True)
+        dao = GlobalRoutePlannerDAO(world_map, hop_resolution)
+        grp = GlobalRoutePlanner(dao)
+        grp.setup()
+        if planner_cache_key is not None:
+            # Retain only the active map's graph so a sequence of different
+            # maps cannot accumulate multiple full mining-road networks.
+            _GLOBAL_ROUTE_PLANNER_CACHE.clear()
+            _GLOBAL_ROUTE_PLANNER_CACHE[planner_cache_key] = grp
+    elif planner_cache_key is not None:
+        print("Route-graph cache hit: reusing {}".format(
+            planner_cache_key), flush=True)
     # Obtain route plan
+    # Where the mining road graph has no forward connection, GlobalRoutePlanner
+    # answers a ~50 m step with a detour of several kilometres, which the
+    # max_len cap rejects. Upstream then retries the next step from the same
+    # anchor, which usually routes around the break. But when that retry keeps
+    # failing, upstream never advances the anchor and the whole remainder of the
+    # route is silently lost: the expert reaches the truncation point, believes
+    # it has arrived, and brakes until the route times out. Keep the retry, and
+    # give up on an anchor after the second failure so the rest survives.
     route = []
-    for i in range(len(waypoints_trajectory) - 1):   # Goes until the one before the last.
-        waypoint = waypoints_trajectory[i]
-        waypoint_next = waypoints_trajectory[i + 1]
-        if waypoint.x != waypoint_next.x or waypoint.y != waypoint_next.y:
-            interpolated_trace = grp.trace_route(waypoint, waypoint_next)
-            if len(interpolated_trace) > max_len:
-                waypoints_trajectory[i + 1] = waypoints_trajectory[i]
-            else:
-                for wp_tuple in interpolated_trace:
-                    route.append((wp_tuple[0].transform, wp_tuple[1]))
+    anchor = waypoints_trajectory[0]
+    failures = 0
+    for waypoint_next in waypoints_trajectory[1:]:
+        if anchor.x == waypoint_next.x and anchor.y == waypoint_next.y:
+            continue
+        interpolated_trace = grp.trace_route(anchor, waypoint_next)
+        if len(interpolated_trace) > max_len:
+            failures += 1
+            if failures >= 2:
+                anchor = waypoint_next
+                failures = 0
+            continue
+        for wp_tuple in interpolated_trace:
+            route.append((wp_tuple[0].transform, wp_tuple[1]))
+        anchor = waypoint_next
+        failures = 0
 
     lat_ref, lon_ref = _get_latlon_ref(world_map)
 

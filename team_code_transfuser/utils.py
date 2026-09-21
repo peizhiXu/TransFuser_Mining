@@ -1,30 +1,30 @@
 import numpy as np
 
-def get_virtual_lidar_to_vehicle_transform():
+def get_virtual_lidar_to_vehicle_transform(lidar_pos):
     # This is a fake lidar coordinate
     T = np.eye(4)
-    T[0, 3] = 1.3
-    T[1, 3] = 0.0
-    T[2, 3] = 2.5
+    T[0, 3] = float(lidar_pos[0])
+    T[1, 3] = float(lidar_pos[1])
+    T[2, 3] = float(lidar_pos[2])
     return T
         
-def get_vehicle_to_virtual_lidar_transform():
-    return np.linalg.inv(get_virtual_lidar_to_vehicle_transform())
+def get_vehicle_to_virtual_lidar_transform(lidar_pos):
+    return np.linalg.inv(get_virtual_lidar_to_vehicle_transform(lidar_pos))
 
-def get_lidar_to_vehicle_transform():
+def get_lidar_to_vehicle_transform(lidar_pos):
     rot = np.array([[0, 1, 0],
                     [-1, 0, 0],
                     [0, 0, 1]], dtype=np.float32)
     T = np.eye(4)
     T[:3, :3] = rot
 
-    T[0, 3] = 1.3
-    T[1, 3] = 0.0
-    T[2, 3] = 2.5
+    T[0, 3] = float(lidar_pos[0])
+    T[1, 3] = float(lidar_pos[1])
+    T[2, 3] = float(lidar_pos[2])
     return T
 
-def get_vehicle_to_lidar_transform():
-    return np.linalg.inv(get_lidar_to_vehicle_transform())
+def get_vehicle_to_lidar_transform(lidar_pos):
+    return np.linalg.inv(get_lidar_to_vehicle_transform(lidar_pos))
 
 def get_lidar_to_bevimage_transform():
     # rot 

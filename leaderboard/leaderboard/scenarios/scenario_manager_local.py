@@ -11,6 +11,7 @@ It must not be modified and is for reference only!
 """
 
 from __future__ import print_function
+import os
 import signal
 import sys
 import time
@@ -95,6 +96,12 @@ class ScenarioManager(object):
         self.start_system_time = None
         self.end_system_time = None
         self.end_game_time = None
+        self._agent = None
+        self.scenario = None
+        self.scenario_tree = None
+        self.scenario_class = None
+        self.ego_vehicles = None
+        self.other_actors = None
 
     def load_scenario(self, scenario, agent, rep_number):
         """
@@ -172,15 +179,16 @@ class ScenarioManager(object):
             if self.scenario_tree.status != py_trees.common.Status.RUNNING:
                 self._running = False
 
-            spectator = CarlaDataProvider.get_world().get_spectator()
-            ego_trans = self.ego_vehicles[0].get_transform()
-            
-            # For third-person view
-            # location = ego_trans.transform(carla.Location(x=-4.5, z=2.3))
-            # spectator.set_transform(carla.Transform(location, carla.Rotation(pitch=-15.0, yaw=ego_trans.rotation.yaw)))
-            
-            # For bird's eye view
-            spectator.set_transform(carla.Transform(ego_trans.location + carla.Location(z=50), carla.Rotation(pitch=-90)))
+            # Keep the usual overhead follow camera unless an interactive
+            # preview asks CARLA to leave the spectator under keyboard control.
+            if os.environ.get('FREE_SPECTATOR', '0') != '1':
+                spectator = CarlaDataProvider.get_world().get_spectator()
+                ego_trans = self.ego_vehicles[0].get_transform()
+
+                # For bird's eye view
+                spectator.set_transform(carla.Transform(
+                    ego_trans.location + carla.Location(z=50),
+                    carla.Rotation(pitch=-90)))
 
         if self._running and self.get_running_status():
             CarlaDataProvider.get_world().tick(self._timeout)

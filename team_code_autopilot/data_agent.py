@@ -1,4 +1,7 @@
 from copy import deepcopy
+import ctypes
+import gc
+import os
 import cv2
 import carla
 
@@ -11,6 +14,25 @@ import json
 from utils import lts_rendering
 from utils.map_utils import MapImage, encode_npy_to_pil, PIXELS_PER_METER
 from autopilot import AutoPilot
+
+
+# A Leaderboard evaluator creates a fresh agent for every route, even when all
+# routes use the same CARLA world.  Re-rasterising a mining map for every agent
+# creates very large temporary Pygame/NumPy allocations.  Keep exactly one
+# immutable road/lane raster for the currently active CARLA map and device.
+# Dynamic BEV channels are still created in render_BEV() for every saved frame.
+_STATIC_BEV_CACHE = {}
+
+
+def _release_cpu_memory():
+    """Return freed large map allocations to Linux between routes."""
+    gc.collect()
+    try:
+        ctypes.CDLL(None).malloc_trim(0)
+    except (AttributeError, OSError):
+        # malloc_trim is glibc-specific; garbage collection is still useful on
+        # other platforms.
+        pass
 
 
 def get_entry_point():
@@ -26,6 +48,10 @@ class DataAgent(AutoPilot):
             'height': 160,
             'fov': 60
         }
+        # CARLA 0.9.10 commonly runs with an old PyTorch build.  Keep the
+        # official CUDA default, while allowing CPU label rendering on GPUs
+        # that the old wheel cannot execute on (for example RTX 50-series).
+        self.datagen_device = os.environ.get('DATAGEN_DEVICE', 'cuda')
 
         self.weathers = {
             'Clear': carla.WeatherParameters.ClearNoon,
@@ -64,25 +90,54 @@ class DataAgent(AutoPilot):
         super()._init(hd_map)
         self._sensors = self.sensor_interface._sensors_objects
 
-        self.vehicle_template = torch.ones(1, 1, 22, 9, device='cuda')
-        self.walker_template = torch.ones(1, 1, 10, 7, device='cuda')
-        self.traffic_light_template = torch.ones(1, 1, 4, 4, device='cuda')
+        self.vehicle_template = torch.ones(1, 1, 22, 9, device=self.datagen_device)
+        self.walker_template = torch.ones(1, 1, 10, 7, device=self.datagen_device)
+        self.traffic_light_template = torch.ones(1, 1, 4, 4, device=self.datagen_device)
 
-        # create map for renderer
-        map_image = MapImage(self._world, self.world_map, PIXELS_PER_METER)
-        make_image = lambda x: np.swapaxes(pygame.surfarray.array3d(x), 0, 1).mean(axis=-1)
-        road = make_image(map_image.map_surface)
-        lane = make_image(map_image.lane_surface)
-        
-        self.global_map = np.zeros((1, 15,) + road.shape)
-        self.global_map[:, 0, ...] = road / 255.
-        self.global_map[:, 1, ...] = lane / 255.
+        # Only road and lane are global, static layers.  The original code
+        # allocated all 15 float64 BEV channels over the complete map and then
+        # copied them to float32.  Large mining maps make that allocation many
+        # gigabytes per route.  Dynamic layers are added after taking the
+        # small local crop in render_BEV().
+        map_name = self._world.get_map().name
+        cache_key = (map_name, str(self.datagen_device))
+        cached = _STATIC_BEV_CACHE.get(cache_key)
+        if cached is None:
+            print("Static BEV cache miss: rasterising {} once".format(map_name))
+            map_image = MapImage(self._world, self.world_map, PIXELS_PER_METER)
+            make_image = lambda x: np.swapaxes(
+                pygame.surfarray.array3d(x), 0, 1
+            ).mean(axis=-1, dtype=np.float32) / np.float32(255.0)
+            road = make_image(map_image.map_surface)
+            lane = make_image(map_image.lane_surface)
+            static_map = np.stack((road, lane), axis=0)[None, ...]
+            global_map = torch.from_numpy(static_map).to(self.datagen_device)
+            world_offset = torch.tensor(
+                map_image._world_offset,
+                device=self.datagen_device,
+                dtype=torch.float32,
+            )
+            cached = (global_map, world_offset, global_map.shape[2:4])
+            # Only retain the current map.  A new CARLA town invalidates the
+            # old cache rather than accumulating one large raster per town.
+            _STATIC_BEV_CACHE.clear()
+            _STATIC_BEV_CACHE[cache_key] = cached
+            del static_map, road, lane, map_image
+            try:
+                pygame.display.quit()
+                pygame.quit()
+            except pygame.error:
+                pass
+            _release_cpu_memory()
+        else:
+            print("Static BEV cache hit: reusing {}".format(map_name))
 
-        self.global_map = torch.tensor(self.global_map, device='cuda', dtype=torch.float32)
-        world_offset = torch.tensor(map_image._world_offset, device='cuda', dtype=torch.float32)
-        self.map_dims = self.global_map.shape[2:4]
+        self.global_map, world_offset, self.map_dims = cached
 
-        self.renderer = lts_rendering.Renderer(world_offset, self.map_dims, data_generation=True)
+        self.renderer = lts_rendering.Renderer(
+            world_offset, self.map_dims, data_generation=True,
+            device=self.datagen_device,
+        )
 
     def sensors(self):
         result = super().sensors()
@@ -272,12 +327,15 @@ class DataAgent(AutoPilot):
         return
     
     def destroy(self):
-        del self.global_map
-        del self.vehicle_template
-        del self.walker_template
-        del self.traffic_light_template
-        del self.map_dims
-        torch.cuda.empty_cache()
+        for name in (
+                'global_map', 'vehicle_template', 'walker_template',
+                'traffic_light_template', 'map_dims', 'renderer', '_actors'):
+            if hasattr(self, name):
+                delattr(self, name)
+        if str(self.datagen_device).startswith('cuda'):
+            torch.cuda.empty_cache()
+        super().destroy()
+        _release_cpu_memory()
 
     def get_bev_cars(self, lidar=None):
         results = []
@@ -445,25 +503,36 @@ class DataAgent(AutoPilot):
         ego_yaw_list =  [self._vehicle.get_transform().rotation.yaw/180*np.pi]
 
         # fetch local birdview per agent
-        ego_pos =  torch.tensor([self._vehicle.get_transform().location.x, self._vehicle.get_transform().location.y], device='cuda', dtype=torch.float32)
-        ego_yaw =  torch.tensor([self._vehicle.get_transform().rotation.yaw/180*np.pi], device='cuda', dtype=torch.float32)
+        ego_pos =  torch.tensor([self._vehicle.get_transform().location.x, self._vehicle.get_transform().location.y], device=self.datagen_device, dtype=torch.float32)
+        ego_yaw =  torch.tensor([self._vehicle.get_transform().rotation.yaw/180*np.pi], device=self.datagen_device, dtype=torch.float32)
         birdview = self.renderer.get_local_birdview(
             semantic_grid,
             ego_pos,
             ego_yaw
         )
+        # The persisted global map has only the two static channels.  Expand
+        # the inexpensive 500x500 local crop to the 15-channel TransFuser BEV
+        # layout before drawing traffic lights, vehicles and pedestrians.
+        static_birdview = birdview
+        birdview = torch.zeros(
+            (static_birdview.shape[0], 15,
+             static_birdview.shape[2], static_birdview.shape[3]),
+            device=self.datagen_device,
+            dtype=static_birdview.dtype,
+        )
+        birdview[:, :2, ...] = static_birdview
 
         self._actors = self._world.get_actors()
         vehicles = self._actors.filter('*vehicle*')
         for vehicle in vehicles:
             if (vehicle.get_location().distance(self._vehicle.get_location()) < self.detection_radius):
                 if (vehicle.id != self._vehicle.id):
-                    pos =  torch.tensor([vehicle.get_transform().location.x, vehicle.get_transform().location.y], device='cuda', dtype=torch.float32)
-                    yaw =  torch.tensor([vehicle.get_transform().rotation.yaw/180*np.pi], device='cuda', dtype=torch.float32)
+                    pos =  torch.tensor([vehicle.get_transform().location.x, vehicle.get_transform().location.y], device=self.datagen_device, dtype=torch.float32)
+                    yaw =  torch.tensor([vehicle.get_transform().rotation.yaw/180*np.pi], device=self.datagen_device, dtype=torch.float32)
                     veh_x_extent = int(max(vehicle.bounding_box.extent.x*2, 1) * PIXELS_PER_METER)
                     veh_y_extent = int(max(vehicle.bounding_box.extent.y*2, 1) * PIXELS_PER_METER)
 
-                    self.vehicle_template = torch.ones(1, 1, veh_x_extent, veh_y_extent, device='cuda')
+                    self.vehicle_template = torch.ones(1, 1, veh_x_extent, veh_y_extent, device=self.datagen_device)
                     self.renderer.render_agent_bv(
                         birdview,
                         ego_pos,
@@ -494,12 +563,12 @@ class DataAgent(AutoPilot):
             template_batched.append(np.ones([20, 7]))
 
         if len(ego_pos_batched)>0:
-            ego_pos_batched_torch = torch.tensor(ego_pos_batched, device='cuda', dtype=torch.float32).unsqueeze(1)
-            ego_yaw_batched_torch = torch.tensor(ego_yaw_batched, device='cuda', dtype=torch.float32).unsqueeze(1)
-            pos_batched_torch = torch.tensor(pos_batched, device='cuda', dtype=torch.float32).unsqueeze(1)
-            yaw_batched_torch = torch.tensor(yaw_batched, device='cuda', dtype=torch.float32).unsqueeze(1)
-            template_batched_torch = torch.tensor(template_batched, device='cuda', dtype=torch.float32).unsqueeze(1)
-            channel_batched_torch = torch.tensor(channel_batched, device='cuda', dtype=torch.float32)
+            ego_pos_batched_torch = torch.tensor(ego_pos_batched, device=self.datagen_device, dtype=torch.float32).unsqueeze(1)
+            ego_yaw_batched_torch = torch.tensor(ego_yaw_batched, device=self.datagen_device, dtype=torch.float32).unsqueeze(1)
+            pos_batched_torch = torch.tensor(pos_batched, device=self.datagen_device, dtype=torch.float32).unsqueeze(1)
+            yaw_batched_torch = torch.tensor(yaw_batched, device=self.datagen_device, dtype=torch.float32).unsqueeze(1)
+            template_batched_torch = torch.tensor(template_batched, device=self.datagen_device, dtype=torch.float32).unsqueeze(1)
+            channel_batched_torch = torch.tensor(channel_batched, device=self.datagen_device, dtype=torch.float32)
 
             self.renderer.render_agent_bv_batched(
                 birdview,
@@ -540,12 +609,12 @@ class DataAgent(AutoPilot):
                 channel_batched.append(2)
 
         if len(ego_pos_batched)>0:
-            ego_pos_batched_torch = torch.tensor(ego_pos_batched, device='cuda', dtype=torch.float32).unsqueeze(1)
-            ego_yaw_batched_torch = torch.tensor(ego_yaw_batched, device='cuda', dtype=torch.float32).unsqueeze(1)
-            pos_batched_torch = torch.tensor(pos_batched, device='cuda', dtype=torch.float32).unsqueeze(1)
-            yaw_batched_torch = torch.tensor(yaw_batched, device='cuda', dtype=torch.float32).unsqueeze(1)
-            template_batched_torch = torch.tensor(template_batched, device='cuda', dtype=torch.float32).unsqueeze(1)
-            channel_batched_torch = torch.tensor(channel_batched, device='cuda', dtype=torch.int)
+            ego_pos_batched_torch = torch.tensor(ego_pos_batched, device=self.datagen_device, dtype=torch.float32).unsqueeze(1)
+            ego_yaw_batched_torch = torch.tensor(ego_yaw_batched, device=self.datagen_device, dtype=torch.float32).unsqueeze(1)
+            pos_batched_torch = torch.tensor(pos_batched, device=self.datagen_device, dtype=torch.float32).unsqueeze(1)
+            yaw_batched_torch = torch.tensor(yaw_batched, device=self.datagen_device, dtype=torch.float32).unsqueeze(1)
+            template_batched_torch = torch.tensor(template_batched, device=self.datagen_device, dtype=torch.float32).unsqueeze(1)
+            channel_batched_torch = torch.tensor(channel_batched, device=self.datagen_device, dtype=torch.int)
 
             self.renderer.render_agent_bv_batched(
                 birdview,

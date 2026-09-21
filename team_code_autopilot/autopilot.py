@@ -16,6 +16,11 @@ from nav_planner import PIDController, RoutePlanner, interpolate_trajectory
 
 SAVE_PATH = os.environ.get('SAVE_PATH', None)
 
+# `carla.Map(opendrive)` and the GlobalRoutePlanner graph are immutable for a
+# loaded CARLA town.  The evaluator makes a fresh agent for every route, so
+# keeping one map object avoids reparsing the same large OpenDRIVE document.
+_ROUTE_MAP_CACHE = {}
+
 
 def get_entry_point():
     return 'AutoPilot'
@@ -44,6 +49,12 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
 
         # Configuration
         self.visualize = int(os.environ['DEBUG_CHALLENGE'])
+        # Collision prediction always runs at 20 Hz.  This only reduces the
+        # number of debug boxes sent to CARLA so long mining-truck forecasts
+        # remain readable in interactive previews.
+        self.debug_draw_stride = max(
+            1, int(os.environ.get('DEBUG_DRAW_STRIDE', '1'))
+        )
         self.save_freq = self.frame_rate_sim//2 # By default, save once every 10 frames (0.5 seconds)
 
         # Controllers
@@ -58,6 +69,7 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
         self.angle_search_range = 0    # Number of future waypoints to consider in angle search
         self.steer_noise = 1e-3         # Noise added to expert steering angle
         self.steer_buffer = deque(maxlen=self.steer_buffer_size)
+        self._planner_frame_offset = np.zeros(2)  # set every tick in _get_control
         
         self._turn_controller = PIDController(K_P=1.25, K_I=0.75, K_D=0.3, n=40)
         self._turn_controller_extrapolation = PIDController(K_P=1.25, K_I=0.75, K_D=0.3, n=40)
@@ -128,9 +140,20 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
 
     def _init(self, hd_map):
         # Near node
-        self.world_map = carla.Map("RouteMap", hd_map[1]['opendrive'])
+        carla_world = CarlaDataProvider.get_world()
+        map_name = carla_world.get_map().name
+        self._route_map_cache_key = map_name
+        self.world_map = _ROUTE_MAP_CACHE.get(map_name)
+        if self.world_map is None:
+            print("Route-map cache miss: parsing {} once".format(map_name), flush=True)
+            self.world_map = carla.Map("RouteMap", hd_map[1]['opendrive'])
+            _ROUTE_MAP_CACHE.clear()
+            _ROUTE_MAP_CACHE[map_name] = self.world_map
+        else:
+            print("Route-map cache hit: reusing {}".format(map_name), flush=True)
         trajectory = [item[0].location for item in self._global_plan_world_coord]
-        self.dense_route, _ = interpolate_trajectory(self.world_map, trajectory)
+        self.dense_route, _ = interpolate_trajectory(
+            self.world_map, trajectory, planner_cache_key=map_name)
         
         print("Sparse Waypoints:", len(self._global_plan))
         print("Dense Waypoints:", len(self.dense_route))
@@ -247,6 +270,7 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
         pos = self._get_position(input_data['gps'][1][:2])
         self.gps_buffer.append(pos)
         pos = np.average(self.gps_buffer, axis=0) # Denoised position
+        self._update_planner_frame_offset(pos)
 
         self._waypoint_planner.load()
         waypoint_route = self._waypoint_planner.run_step(pos)
@@ -345,7 +369,16 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
             json.dump(data, f, indent=4)
 
     def destroy(self):
-        pass
+        # Route-specific planners and waypoint lists may hold many CARLA
+        # waypoint objects.  The shared map and routing graph live in their
+        # module caches; all per-route state must be dropped here.
+        for name in (
+                'dense_route', '_waypoint_planner',
+                '_waypoint_planner_extrapolation', '_command_planner',
+                '_global_plan', '_global_plan_world_coord', 'future_states',
+                'gps_buffer', 'vehicle_speed_buffer', 'world_map'):
+            if hasattr(self, name):
+                delattr(self, name)
 
     def _get_steer(self, brake, route, pos, theta, speed, restore=True):
         if self._waypoint_planner.is_last: # end of route
@@ -601,7 +634,8 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
                                                             roll  = walker.bounding_box.rotation.roll  + walker_transform.rotation.roll)
 
                         color = carla.Color(0, 0, 255, 255)
-                        if (self.visualize == 1):
+                        if (self.visualize == 1 and
+                                i % self.debug_draw_stride == 0):
                             self._world.debug.draw_box(box=bounding_box, rotation=bounding_box.rotation, thickness=0.1, color=color, life_time=(1.0 / self.frame_rate_sim))
                         walker_future_bbs.append(bounding_box)
                     nearby_walkers.append(walker_future_bbs)
@@ -645,14 +679,19 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
 
                         delta_yaws = next_yaw.item() * 180.0 / np.pi
 
-                        transform             = carla.Transform(carla.Location(x=next_loc[0].item(), y=next_loc[1].item(), z=traffic_transform.location.z))
-                        bounding_box          = carla.BoundingBox(transform.location, vehicle.bounding_box.extent)
-                        bounding_box.rotation = carla.Rotation(pitch=float(traffic_transform.rotation.pitch),
-                                                            yaw=float(delta_yaws),
-                                                            roll=float(traffic_transform.rotation.roll))
+                        predicted_location = carla.Location(
+                            x=next_loc[0].item(), y=next_loc[1].item(),
+                            z=traffic_transform.location.z)
+                        predicted_rotation = carla.Rotation(
+                            pitch=float(traffic_transform.rotation.pitch),
+                            yaw=float(delta_yaws),
+                            roll=float(traffic_transform.rotation.roll))
+                        bounding_box = self._actor_bounding_box_at(
+                            vehicle, predicted_location, predicted_rotation)
 
                         color = carla.Color(0, 0, 255, 255)
-                        if (self.visualize == 1):
+                        if (self.visualize == 1 and
+                                i % self.debug_draw_stride == 0):
                             self._world.debug.draw_box(box=bounding_box, rotation=bounding_box.rotation, thickness=0.1, color=color, life_time=(1.0 / self.frame_rate_sim))
                         veh_future_bbs.append(bounding_box)
                     
@@ -693,7 +732,7 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
 
                 # calculate ego vehicle bounding box for the next timestep. We don't consider timestep 0 because it is from the past and has already happened.
                 next_loc_no_brake, next_yaw_no_brake, next_speed_no_brake = self.ego_model.forward(next_loc_no_brake, next_yaw_no_brake, next_speed_no_brake, action_no_brake)
-                next_loc_no_brake_temp = np.array([-next_loc_no_brake[1], next_loc_no_brake[0]])
+                next_loc_no_brake_temp = self._world_to_planner(next_loc_no_brake)
                 next_yaw_no_brake_temp = next_yaw_no_brake.item() + np.pi/2 # in global coordinates
 
                 waypoint_route_extrapolation_temp = self._waypoint_planner_extrapolation.run_step(next_loc_no_brake_temp)
@@ -703,22 +742,49 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
                 action_no_brake = np.array(np.stack([steer_extrapolation_temp, float(throttle_extrapolation_temp), brake_extrapolation_temp], axis=-1))
 
                 delta_yaws_no_brake = next_yaw_no_brake.item() * 180.0 / np.pi
-                cosine = np.cos(next_yaw_no_brake.item())
-                sine = np.sin(next_yaw_no_brake.item())
-
-                extent           = self._vehicle.bounding_box.extent
-                extent_org       = self._vehicle.bounding_box.extent
+                actor_rotation = carla.Rotation(
+                    pitch=float(vehicle_transform.rotation.pitch),
+                    yaw=float(delta_yaws_no_brake),
+                    roll=float(vehicle_transform.rotation.roll))
+                full_box = self._actor_bounding_box_at(
+                    self._vehicle,
+                    carla.Location(
+                        x=next_loc_no_brake[0].item(),
+                        y=next_loc_no_brake[1].item(),
+                        z=vehicle_transform.location.z),
+                    actor_rotation)
+                extent_org = full_box.extent
+                extent = carla.Vector3D(
+                    full_box.extent.x, full_box.extent.y,
+                    full_box.extent.z)
+                # The hull is built from two half-length boxes placed ahead of
+                # and behind the centre, so both offsets below must use this
+                # halved half-length. extent.y is the half-width and is only the
+                # box size. Using it in the y offset separates the two halves by
+                # (extent.y - extent.x) * 2 * sin(yaw), leaving an unchecked gap
+                # at the vehicle centre: 0.67 m on the 9.4 m mining truck when
+                # it heads north or south. Fixed for autopilot_mine.py, which
+                # inherits _get_brake from here.
                 extent.x         = extent.x / 2.
+                bbox_yaw = math.radians(full_box.rotation.yaw)
+                cosine = math.cos(bbox_yaw)
+                sine = math.sin(bbox_yaw)
 
                 # front half
-                transform             = carla.Transform(carla.Location(x=next_loc_no_brake[0].item()+extent.x*cosine, y=next_loc_no_brake[1].item()+extent.y*sine, z=vehicle_transform.location.z))
-                bounding_box          = carla.BoundingBox(transform.location, extent)
-                bounding_box.rotation = carla.Rotation(pitch=float(vehicle_transform.rotation.pitch), yaw=float(delta_yaws_no_brake), roll=float(vehicle_transform.rotation.roll))
+                bounding_box = carla.BoundingBox(
+                    carla.Location(
+                        x=full_box.location.x + extent.x * cosine,
+                        y=full_box.location.y + extent.x * sine,
+                        z=full_box.location.z), extent)
+                bounding_box.rotation = full_box.rotation
 
                 # back half
-                transform_back             = carla.Transform(carla.Location(x=next_loc_no_brake[0].item()-extent.x*cosine, y=next_loc_no_brake[1].item()-extent.y*sine, z=vehicle_transform.location.z))
-                bounding_box_back          = carla.BoundingBox(transform_back.location, extent)
-                bounding_box_back.rotation = carla.Rotation(pitch=float(vehicle_transform.rotation.pitch), yaw=float(delta_yaws_no_brake), roll=float(vehicle_transform.rotation.roll))
+                bounding_box_back = carla.BoundingBox(
+                    carla.Location(
+                        x=full_box.location.x - extent.x * cosine,
+                        y=full_box.location.y - extent.x * sine,
+                        z=full_box.location.z), extent)
+                bounding_box_back.rotation = full_box.rotation
                 
                 color = carla.Color(0, color_value, 0, alpha)
                 color2 = carla.Color(0, color_value, color_value, alpha)
@@ -753,7 +819,8 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
                             walker_hazard = True
                         self.walker_hazard[i] = True
 
-                if (self.visualize == 1):
+                if (self.visualize == 1 and
+                        i % self.debug_draw_stride == 0):
                     self._world.debug.draw_box(box=bounding_box, rotation=bounding_box.rotation, thickness=0.1, color=color, life_time=(1.0 / self.frame_rate_sim))
                     self._world.debug.draw_box(box=bounding_box_back, rotation=bounding_box.rotation, thickness=0.1, color=color2, life_time=(1.0 / self.frame_rate_sim))
 
@@ -846,7 +913,8 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
                                                         roll  = walker.bounding_box.rotation.roll  + walker_transform.rotation.roll)
 
                     color = carla.Color(0, 0, 255, 255)
-                    if (self.visualize == 1):
+                    if (self.visualize == 1 and
+                            i % self.debug_draw_stride == 0):
                         self._world.debug.draw_box(box=bounding_box, rotation=bounding_box.rotation, thickness=0.1, color=color, life_time=(1.0 / self.frame_rate_sim))
                     walker_future_bbs.append(bounding_box)
                 nearby_walkers.append(walker_future_bbs)
@@ -889,14 +957,19 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
                     next_loc, next_yaw, next_speed = self.vehicle_model.forward(next_loc, next_yaw, next_speed, action)
                     delta_yaws = next_yaw.item() * 180.0 / np.pi
 
-                    transform             = carla.Transform(carla.Location(x=next_loc[0].item(), y=next_loc[1].item(), z=traffic_transform.location.z))
-                    bounding_box          = carla.BoundingBox(transform.location, vehicle.bounding_box.extent)
-                    bounding_box.rotation = carla.Rotation(pitch=float(traffic_transform.rotation.pitch),
-                                                        yaw=float(delta_yaws),
-                                                        roll=float(traffic_transform.rotation.roll))
+                    predicted_location = carla.Location(
+                        x=next_loc[0].item(), y=next_loc[1].item(),
+                        z=traffic_transform.location.z)
+                    predicted_rotation = carla.Rotation(
+                        pitch=float(traffic_transform.rotation.pitch),
+                        yaw=float(delta_yaws),
+                        roll=float(traffic_transform.rotation.roll))
+                    bounding_box = self._actor_bounding_box_at(
+                        vehicle, predicted_location, predicted_rotation)
 
                     color = carla.Color(0, 0, 255, 255)
-                    if (self.visualize == 1):
+                    if (self.visualize == 1 and
+                            i % self.debug_draw_stride == 0):
                         self._world.debug.draw_box(box=bounding_box, rotation=bounding_box.rotation, thickness=0.1, color=color, life_time=(1.0 / self.frame_rate_sim))
                     veh_future_bbs.append(bounding_box)
                 
@@ -959,21 +1032,40 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
                 # next_yaw = np.array([delta_yaw]) #+ delta_yaw
 
                 next_yaw_deg = tmp_yaw.item() * 180.0 / np.pi
-                cosine = np.cos(tmp_yaw.item())
-                sine = np.sin(tmp_yaw.item())
-
-                extent           = self._vehicle.bounding_box.extent
+                actor_rotation = carla.Rotation(
+                    pitch=float(vehicle_transform.rotation.pitch),
+                    yaw=float(next_yaw_deg),
+                    roll=float(vehicle_transform.rotation.roll))
+                full_box = self._actor_bounding_box_at(
+                    self._vehicle,
+                    carla.Location(
+                        x=tmp_loc[0].item(), y=tmp_loc[1].item(),
+                        z=vehicle_transform.location.z),
+                    actor_rotation)
+                extent = carla.Vector3D(
+                    full_box.extent.x, full_box.extent.y,
+                    full_box.extent.z)
+                # See the note above: both offsets use the halved half-length.
                 extent.x         = extent.x / 2.
+                bbox_yaw = math.radians(full_box.rotation.yaw)
+                cosine = math.cos(bbox_yaw)
+                sine = math.sin(bbox_yaw)
 
                 # front half
-                transform             = carla.Transform(carla.Location(x=tmp_loc[0].item()+extent.x*cosine, y=tmp_loc[1].item()+extent.y*sine, z=vehicle_transform.location.z))
-                bounding_box          = carla.BoundingBox(transform.location, extent)
-                bounding_box.rotation = carla.Rotation(pitch=float(vehicle_transform.rotation.pitch), yaw=float(next_yaw_deg), roll=float(vehicle_transform.rotation.roll))
+                bounding_box = carla.BoundingBox(
+                    carla.Location(
+                        x=full_box.location.x + extent.x * cosine,
+                        y=full_box.location.y + extent.x * sine,
+                        z=full_box.location.z), extent)
+                bounding_box.rotation = full_box.rotation
 
                 # back half
-                transform_back             = carla.Transform(carla.Location(x=tmp_loc[0].item()-extent.x*cosine, y=tmp_loc[1].item()-extent.y*sine, z=vehicle_transform.location.z))
-                bounding_box_back          = carla.BoundingBox(transform_back.location, extent)
-                bounding_box_back.rotation = carla.Rotation(pitch=float(vehicle_transform.rotation.pitch), yaw=float(next_yaw_deg), roll=float(vehicle_transform.rotation.roll))
+                bounding_box_back = carla.BoundingBox(
+                    carla.Location(
+                        x=full_box.location.x - extent.x * cosine,
+                        y=full_box.location.y - extent.x * sine,
+                        z=full_box.location.z), extent)
+                bounding_box_back.rotation = full_box.rotation
                 
                 color = carla.Color(0, color_value, 0, alpha)
                 color2 = carla.Color(0, color_value, color_value, alpha)
@@ -1010,7 +1102,8 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
                             walker_hazard = True
                         self.walker_hazard[i] = True
 
-                if (self.visualize == 1):
+                if (self.visualize == 1 and
+                        index % self.debug_draw_stride == 0):
                     self._world.debug.draw_box(box=bounding_box, rotation=bounding_box.rotation, thickness=0.1, color=color, life_time=(1.0 / self.frame_rate_sim))
                     self._world.debug.draw_box(box=bounding_box_back, rotation=bounding_box.rotation, thickness=0.1, color=color2, life_time=(1.0 / self.frame_rate_sim))
 
@@ -1035,7 +1128,7 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
         for i in range(number_of_future_frames):
             # calculate ego vehicle bounding box for the next timestep. We don't consider timestep 0 because it is from the past and has already happened.
             next_loc, next_yaw, next_speed = self.ego_model.forward(next_loc, next_yaw, next_speed, action)
-            next_loc_temp = np.array([-next_loc[1], next_loc[0]])
+            next_loc_temp = self._world_to_planner(next_loc)
             next_yaw_temp = next_yaw.item() + np.pi/2 # in global coordinates
 
             waypoint_route_temp = self._waypoint_planner.run_step(next_loc_temp)
@@ -1071,6 +1164,30 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
         speed = np.dot(vel_np, orientation)
         return speed
 
+    def _update_planner_frame_offset(self, planner_pos):
+        """Record the shift between CARLA world coordinates and the planner frame.
+
+        The route planner and _get_position work in the GPS projection that
+        RoutePlanner.set_route builds, while the ego forecast integrates in CARLA
+        world coordinates. The two frames share the (-y, x) rotation but not the
+        origin. On a map whose OpenDRIVE carries a georeference the offset is
+        small enough to go unnoticed; the mining maps have none, so CARLA falls
+        back to a default geodetic origin and the offset is about 4.7e6 m. Feeding
+        raw world coordinates to the planner then aimed every forecast step at a
+        target millions of metres away, and the rollout steered roughly seven
+        times harder than the vehicle actually does.
+        """
+        location = self._vehicle.get_transform().location
+        self._planner_frame_offset = (
+            np.asarray(planner_pos, dtype=np.float64)
+            - np.array([-location.y, location.x])
+        )
+
+    def _world_to_planner(self, world_xy):
+        """Rotate a CARLA world (x, y) into the planner frame."""
+        rotated = np.array([-world_xy[1], world_xy[0]], dtype=np.float64)
+        return rotated + self._planner_frame_offset
+
     def _get_position(self, gps):
         gps = (gps - self._command_planner.mean) * self._command_planner.scale
         return gps
@@ -1080,6 +1197,30 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
 
     def cross_product(self, vector1, vector2):
         return carla.Vector3D(x=vector1.y * vector2.z - vector1.z * vector2.y, y=vector1.z * vector2.x - vector1.x * vector2.z, z=vector1.x * vector2.y - vector1.y * vector2.x)
+
+    @staticmethod
+    def _actor_bounding_box_at(actor, actor_location, actor_rotation):
+        """Return an actor's OBB at a predicted actor transform.
+
+        CARLA stores ``bounding_box.location`` in actor-local coordinates.
+        Custom vehicles often have a non-zero value, so placing forecast boxes
+        directly at the actor origin shifts visualization and collision checks.
+        """
+        local_box = actor.bounding_box
+        actor_transform = carla.Transform(actor_location, actor_rotation)
+        local_center = carla.Location(
+            x=local_box.location.x,
+            y=local_box.location.y,
+            z=local_box.location.z)
+        center = actor_transform.transform(local_center)
+        extent = carla.Vector3D(
+            local_box.extent.x, local_box.extent.y, local_box.extent.z)
+        box = carla.BoundingBox(center, extent)
+        box.rotation = carla.Rotation(
+            pitch=actor_rotation.pitch + local_box.rotation.pitch,
+            yaw=actor_rotation.yaw + local_box.rotation.yaw,
+            roll=actor_rotation.roll + local_box.rotation.roll)
+        return box
 
     def get_separating_plane(self, rPos, plane, obb1, obb2):
         ''' Checks if there is a seperating plane

@@ -44,6 +44,17 @@ from srunner.scenariomanager.scenarioatomics.atomic_criteria_local import (Colli
                                                                      RunningStopTest,
                                                                      ActorSpeedAboveThresholdTest)
 
+
+DEFAULT_EGO_VEHICLE_MODEL = 'vehicle.lincoln.mkz2017'
+
+
+def _ego_vehicle_model():
+    return os.environ.get('EGO_VEHICLE_MODEL', DEFAULT_EGO_VEHICLE_MODEL)
+
+
+def _background_vehicle_model():
+    return os.environ.get('BACKGROUND_VEHICLE_MODEL', 'vehicle.*')
+
 from leaderboard.utils.route_parser import RouteParser, TRIGGER_THRESHOLD, TRIGGER_ANGLE_THRESHOLD
 from leaderboard.utils.route_manipulation import interpolate_trajectory
 
@@ -247,9 +258,16 @@ class RouteScenario(BasicScenario):
         elevate_transform = self.route[0][0]
         elevate_transform.location.z += 0.5
 
-        ego_vehicle = CarlaDataProvider.request_new_actor('vehicle.lincoln.mkz2017',
+        ego_vehicle = CarlaDataProvider.request_new_actor(_ego_vehicle_model(),
                                                           elevate_transform,
                                                           rolename='hero')
+        print("Ego vehicle model: {}".format(ego_vehicle.type_id))
+        expected_model = os.environ.get('EXPECTED_EGO_VEHICLE_MODEL')
+        if expected_model and ego_vehicle.type_id != expected_model:
+            raise RuntimeError(
+                "Wrong ego vehicle: spawned %s, expected %s"
+                % (ego_vehicle.type_id, expected_model)
+            )
 
         spectator = CarlaDataProvider.get_world().get_spectator()
         ego_trans = ego_vehicle.get_transform()
@@ -389,7 +407,7 @@ class RouteScenario(BasicScenario):
             scenario_configuration.other_actors = list_of_actor_conf_instances
             scenario_configuration.trigger_points = [egoactor_trigger_position]
             scenario_configuration.subtype = definition['scenario_type']
-            scenario_configuration.ego_vehicles = [ActorConfigurationData('vehicle.lincoln.mkz2017',
+            scenario_configuration.ego_vehicles = [ActorConfigurationData(_ego_vehicle_model(),
                                                                           ego_vehicle.get_transform(),
                                                                           'hero')]
             route_var_name = "ScenarioRouteNumber{}".format(scenario_number)
@@ -423,7 +441,13 @@ class RouteScenario(BasicScenario):
             """
             sublist_of_actors = []
             for actor_def in list_of_actor_def:
-                sublist_of_actors.append(convert_json_to_actor(actor_def))
+                actor = convert_json_to_actor(actor_def)
+                if actor.model.startswith('vehicle.'):
+                    actor.model = os.environ.get(
+                        'SCENARIO_VEHICLE_MODEL',
+                        os.environ.get('BACKGROUND_VEHICLE_MODEL', actor.model)
+                    )
+                sublist_of_actors.append(actor)
 
             return sublist_of_actors
 
@@ -461,20 +485,48 @@ class RouteScenario(BasicScenario):
                 'Town10HD': 80,
             }
 
-            amount = town_amount[config.town] if config.town in town_amount else 0
-            amount = random.randint(amount, 2*amount)
+            amount_override = os.environ.get('BACKGROUND_VEHICLE_COUNT')
+            if amount_override is not None:
+                amount = max(0, int(amount_override))
+            else:
+                amount = town_amount[config.town] if config.town in town_amount else 0
+                amount = random.randint(amount, 2*amount) if amount > 0 else 0
         else:
-            amount = 500 # use all spawn points
+            amount = max(0, int(os.environ.get(
+                'BACKGROUND_VEHICLE_COUNT', 500
+            )))
 
-        new_actors = CarlaDataProvider.request_new_batch_actors('vehicle.*',
-                                                                amount,
-                                                                carla.Transform(),
-                                                                autopilot=True,
-                                                                random_location=True,
-                                                                rolename='background')
+        new_actors = CarlaDataProvider.request_new_batch_actors(
+            _background_vehicle_model(),
+            amount,
+            carla.Transform(),
+            autopilot=True,
+            random_location=True,
+            rolename='background'
+        ) if amount > 0 else []
+        print("Background vehicles: {} x {}".format(
+            len(new_actors) if new_actors is not None else 0,
+            _background_vehicle_model(),
+        ))
 
         if new_actors is None:
             raise Exception("Error: Unable to add the background activity, all spawn points were occupied")
+
+        # CARLA 0.9.10 enables opportunistic lane changes by default. That
+        # policy assumes passenger-car dimensions and normal (roughly 3.5 m)
+        # lanes. The mining maps use 15 m lanes; an automatic change therefore
+        # asks an HD465 to traverse about 15 m laterally and can leave the
+        # 9.4 m truck perpendicular to the lane. Allow mining launchers to turn
+        # this policy off while retaining Traffic Manager routing at junctions.
+        auto_lane_change = os.environ.get('BACKGROUND_AUTO_LANE_CHANGE')
+        if auto_lane_change is not None:
+            enabled = auto_lane_change.strip().lower() in (
+                '1', 'true', 'yes', 'on')
+            traffic_manager = CarlaDataProvider.get_client().get_trafficmanager(
+                CarlaDataProvider.get_traffic_manager_port())
+            for actor in new_actors:
+                traffic_manager.auto_lane_change(actor, enabled)
+            print("Background automatic lane changes: {}".format(enabled))
 
         for _actor in new_actors:
             self.other_actors.append(_actor)
