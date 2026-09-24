@@ -9,6 +9,7 @@ WORK_DIR=${WORK_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}
 PYTHON_BIN=${PYTHON_BIN:-python3}
 CARLA_ROOT=${CARLA_ROOT:?Set CARLA_ROOT to the custom CARLA installation}
 TEAM_CONFIG=${TEAM_CONFIG:?Set TEAM_CONFIG to the checkpoint directory}
+TEAM_AGENT=${TEAM_AGENT:-${WORK_DIR}/team_code_transfuser/submission_agent.py}
 ROUTES=${ROUTES:-${WORK_DIR}/leaderboard/data/mining/split_v2/val_routes.xml}
 SCENARIOS=${SCENARIOS:-${WORK_DIR}/leaderboard/data/mining/empty_scenarios.json}
 CHECKPOINT_ENDPOINT=${CHECKPOINT_ENDPOINT:-${WORK_DIR}/results/hd465_transfuser_eval.json}
@@ -29,12 +30,16 @@ SAVE_COMPOSITE_FRAMES=${SAVE_COMPOSITE_FRAMES:-1}
 PROVENANCE=${PROVENANCE:-${ROUTES}.provenance.json}
 RESULT_TABLE_DIR=${RESULT_TABLE_DIR:-${CHECKPOINT_ENDPOINT%.json}_result_tables}
 
-for required in "${ROUTES}" "${SCENARIOS}" "${TEAM_CONFIG}/args.txt"; do
+for required in "${ROUTES}" "${SCENARIOS}" "${TEAM_AGENT}"; do
   if [[ ! -e "${required}" ]]; then
     echo "ERROR: required path does not exist: ${required}" >&2
     exit 2
   fi
 done
+if [[ ! -e "${TEAM_CONFIG}/args.txt" && ! -e "${TEAM_CONFIG}/args.json" ]]; then
+  echo "ERROR: checkpoint directory has neither args.txt nor args.json: ${TEAM_CONFIG}" >&2
+  exit 2
+fi
 
 mkdir -p "$(dirname "${CHECKPOINT_ENDPOINT}")"
 
@@ -73,7 +78,7 @@ evaluator_args=(
   --repetitions="${REPETITIONS}"
   --track=SENSORS
   --checkpoint="${CHECKPOINT_ENDPOINT}"
-  --agent="${WORK_DIR}/team_code_transfuser/submission_agent.py"
+  --agent="${TEAM_AGENT}"
   --agent-config="${TEAM_CONFIG}"
   --debug="${DEBUG_CHALLENGE}"
 )

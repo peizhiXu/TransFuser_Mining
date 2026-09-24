@@ -1,0 +1,162 @@
+{
+  "format": "wote-mining-dense-routes-v1",
+  "route_xml": "/home/ubuntu/projects/transfuser-wote/leaderboard/data/mining/routes_final/0325_3bangwan.xml",
+  "xodr": "/home/ubuntu/carla_0.9.10_dirty/CARLA_0.9.10-dirty/CarlaUE4/Content/0325_3/Maps/0325_3/OpenDrive/0325_3.xodr",
+  "carla_root": "/home/ubuntu/carla_0.9.10_dirty/CARLA_0.9.10-dirty",
+  "hop_resolution_m": 1.0,
+  "construction": "leaderboard sparse XML to GlobalRoutePlanner trace",
+  "routes": {
+    "0": {
+      "collection_index": 0,
+      "xml_route_id": 0,
+      "town": "0325_3",
+      "file": "0325_3bangwan_index0_id0.npz",
+      "points": 265,
+      "length_m": 204.94479370117188
+    },
+    "1": {
+      "collection_index": 1,
+      "xml_route_id": 1,
+      "town": "0325_3",
+      "file": "0325_3bangwan_index1_id1.npz",
+      "points": 571,
+      "length_m": 468.8928527832031
+    },
+    "2": {
+      "collection_index": 2,
+      "xml_route_id": 3,
+      "town": "0325_3",
+      "file": "0325_3bangwan_index2_id3.npz",
+      "points": 869,
+      "length_m": 663.8818359375
+    },
+    "3": {
+      "collection_index": 3,
+      "xml_route_id": 4,
+      "town": "0325_3",
+      "file": "0325_3bangwan_index3_id4.npz",
+      "points": 1002,
+      "length_m": 736.004638671875
+    },
+    "4": {
+      "collection_index": 4,
+      "xml_route_id": 5,
+      "town": "0325_3",
+      "file": "0325_3bangwan_index4_id5.npz",
+      "points": 661,
+      "length_m": 491.7591552734375
+    },
+    "5": {
+      "collection_index": 5,
+      "xml_route_id": 6,
+      "town": "0325_3",
+      "file": "0325_3bangwan_index5_id6.npz",
+      "points": 648,
+      "length_m": 482.7591857910156
+    },
+    "6": {
+      "collection_index": 6,
+      "xml_route_id": 7,
+      "town": "0325_3",
+      "file": "0325_3bangwan_index6_id7.npz",
+      "points": 661,
+      "length_m": 378.2647705078125
+    },
+    "7": {
+      "collection_index": 7,
+      "xml_route_id": 8,
+      "town": "0325_3",
+      "file": "0325_3bangwan_index7_id8.npz",
+      "points": 287,
+      "length_m": 228.565185546875
+    },
+    "8": {
+      "collection_index": 8,
+      "xml_route_id": 9,
+      "town": "0325_3",
+      "file": "0325_3bangwan_index8_id9.npz",
+      "points": 353,
+      "length_m": 262.08868408203125
+    },
+    "9": {
+      "collection_index": 9,
+      "xml_route_id": 10,
+      "town": "0325_3",
+      "file": "0325_3bangwan_index9_id10.npz",
+      "points": 176,
+      "length_m": 125.02934265136719
+    },
+    "10": {
+      "collection_index": 10,
+      "xml_route_id": 11,
+      "town": "0325_3",
+      "file": "0325_3bangwan_index10_id11.npz",
+      "points": 126,
+      "length_m": 89.94465637207031
+    },
+    "11": {
+      "collection_index": 11,
+      "xml_route_id": 12,
+      "town": "0325_3",
+      "file": "0325_3bangwan_index11_id12.npz",
+      "points": 997,
+      "length_m": 556.581298828125
+    },
+    "12": {
+      "collection_index": 12,
+      "xml_route_id": 13,
+      "town": "0325_3",
+      "file": "0325_3bangwan_index12_id13.npz",
+      "points": 683,
+      "length_m": 572.77978515625
+    },
+    "13": {
+      "collection_index": 13,
+      "xml_route_id": 14,
+      "town": "0325_3",
+      "file": "0325_3bangwan_index13_id14.npz",
+      "points": 208,
+      "length_m": 125.15118408203125
+    },
+    "14": {
+      "collection_index": 14,
+      "xml_route_id": 15,
+      "town": "0325_3",
+      "file": "0325_3bangwan_index14_id15.npz",
+      "points": 180,
+      "length_m": 122.16598510742188
+    },
+    "15": {
+      "collection_index": 15,
+      "xml_route_id": 16,
+      "town": "0325_3",
+      "file": "0325_3bangwan_index15_id16.npz",
+      "points": 1469,
+      "length_m": 912.8399658203125
+    },
+    "16": {
+      "collection_index": 16,
+      "xml_route_id": 17,
+      "town": "0325_3",
+      "file": "0325_3bangwan_index16_id17.npz",
+      "points": 1876,
+      "length_m": 1058.3785400390625
+    },
+    "17": {
+      "collection_index": 17,
+      "xml_route_id": 18,
+      "town": "0325_3",
+      "file": "0325_3bangwan_index17_id18.npz",
+      "points": 335,
+      "length_m": 174.91676330566406
+    },
+    "18": {
+      "collection_index": 18,
+      "xml_route_id": 19,
+      "town": "0325_3",
+      "file": "0325_3bangwan_index18_id19.npz",
+      "points": 368,
+      "length_m": 231.43295288085938
+    }
+  }
+}

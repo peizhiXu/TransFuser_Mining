@@ -1,0 +1,106 @@
+{
+  "format": "wote-mining-dense-routes-v1",
+  "route_xml": "/home/ubuntu/projects/transfuser-wote/leaderboard/data/mining/routes_final/0325_4yutian.xml",
+  "xodr": "/home/ubuntu/carla_0.9.10_dirty/CARLA_0.9.10-dirty/CarlaUE4/Content/0325_4/Maps/0325_4/OpenDrive/0325_4.xodr",
+  "carla_root": "/home/ubuntu/carla_0.9.10_dirty/CARLA_0.9.10-dirty",
+  "hop_resolution_m": 1.0,
+  "construction": "leaderboard sparse XML to GlobalRoutePlanner trace",
+  "routes": {
+    "0": {
+      "collection_index": 0,
+      "xml_route_id": 0,
+      "town": "0325_4",
+      "file": "0325_4yutian_index0_id0.npz",
+      "points": 1236,
+      "length_m": 963.280029296875
+    },
+    "1": {
+      "collection_index": 1,
+      "xml_route_id": 1,
+      "town": "0325_4",
+      "file": "0325_4yutian_index1_id1.npz",
+      "points": 365,
+      "length_m": 225.0347900390625
+    },
+    "2": {
+      "collection_index": 2,
+      "xml_route_id": 2,
+      "town": "0325_4",
+      "file": "0325_4yutian_index2_id2.npz",
+      "points": 565,
+      "length_m": 344.3815612792969
+    },
+    "3": {
+      "collection_index": 3,
+      "xml_route_id": 3,
+      "town": "0325_4",
+      "file": "0325_4yutian_index3_id3.npz",
+      "points": 321,
+      "length_m": 215.68685913085938
+    },
+    "4": {
+      "collection_index": 4,
+      "xml_route_id": 4,
+      "town": "0325_4",
+      "file": "0325_4yutian_index4_id4.npz",
+      "points": 274,
+      "length_m": 193.00038146972656
+    },
+    "5": {
+      "collection_index": 5,
+      "xml_route_id": 5,
+      "town": "0325_4",
+      "file": "0325_4yutian_index5_id5.npz",
+      "points": 428,
+      "length_m": 284.88885498046875
+    },
+    "6": {
+      "collection_index": 6,
+      "xml_route_id": 6,
+      "town": "0325_4",
+      "file": "0325_4yutian_index6_id6.npz",
+      "points": 2222,
+      "length_m": 1206.03125
+    },
+    "7": {
+      "collection_index": 7,
+      "xml_route_id": 7,
+      "town": "0325_4",
+      "file": "0325_4yutian_index7_id7.npz",
+      "points": 467,
+      "length_m": 273.09161376953125
+    },
+    "8": {
+      "collection_index": 8,
+      "xml_route_id": 8,
+      "town": "0325_4",
+      "file": "0325_4yutian_index8_id8.npz",
+      "points": 454,
+      "length_m": 264.74530029296875
+    },
+    "9": {
+      "collection_index": 9,
+      "xml_route_id": 9,
+      "town": "0325_4",
+      "file": "0325_4yutian_index9_id9.npz",
+      "points": 391,
+      "length_m": 240.1485595703125
+    },
+    "10": {
+      "collection_index": 10,
+      "xml_route_id": 10,
+      "town": "0325_4",
+      "file": "0325_4yutian_index10_id10.npz",
+      "points": 111,
+      "length_m": 93.99480438232422
+    },
+    "11": {
+      "collection_index": 11,
+      "xml_route_id": 11,
+      "town": "0325_4",
+      "file": "0325_4yutian_index11_id11.npz",
+      "points": 325,
+      "length_m": 198.65045166015625
+    }
+  }
+}

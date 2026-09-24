@@ -117,7 +117,7 @@ class TransfuserBackbone(nn.Module):
         
         return p2, p3, p4, p5
 
-    def forward(self, image, lidar, velocity):
+    def forward(self, image, lidar, velocity, return_fused_lidar=False):
         '''
         Image + LiDAR feature fusion using transformers
         Args:
@@ -208,6 +208,8 @@ class TransfuserBackbone(nn.Module):
         fused_features = image_features + lidar_features
 
         features = self.top_down(x4)
+        if return_fused_lidar:
+            return features, image_features_grid, fused_features, x4
         return features, image_features_grid, fused_features
 
 

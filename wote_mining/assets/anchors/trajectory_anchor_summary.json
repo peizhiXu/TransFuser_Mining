@@ -1,0 +1,22 @@
+{
+  "data_root": "/media/ubuntu/徐培智/dataset_transfuser_hd465/raw",
+  "assignments": "/home/ubuntu/projects/transfuser-wote/leaderboard/data/mining/split_v2/split_assignments.csv",
+  "assignments_sha256": "08937be7466a51c5bde849c4ca56f9bf64ab960f06e3a88f4c4080a4d72b3ea4",
+  "train_routes": 120,
+  "train_frames": 30736,
+  "train_windows_4s": 29776,
+  "coordinate_frame": "current vehicle, x forward, y right, yaw radians",
+  "sampling_seconds": 0.5,
+  "future_steps": 8,
+  "horizon_seconds": 4.0,
+  "num_anchors": 256,
+  "seed": 0,
+  "heading_weight_m_per_rad": 1.0,
+  "cluster_size_min": 4,
+  "cluster_size_median": 75.0,
+  "cluster_size_max": 1025,
+  "mean_position_error_m": 0.13959698379039764,
+  "p95_position_error_m": 0.5010113298892972,
+  "mean_endpoint_error_m": 0.2520753741264343,
+  "p95_endpoint_error_m": 0.8214375078678131
+}

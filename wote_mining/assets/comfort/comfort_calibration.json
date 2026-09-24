@@ -1,0 +1,46 @@
+{
+  "data_root": "/media/ubuntu/徐培智/dataset_transfuser_hd465/raw",
+  "assignments": "/home/ubuntu/projects/transfuser-wote/leaderboard/data/mining/split_v2/split_assignments.csv",
+  "assignments_sha256": "08937be7466a51c5bde849c4ca56f9bf64ab960f06e3a88f4c4080a4d72b3ea4",
+  "train_routes": 120,
+  "expert_windows_4s": 29776,
+  "sampling_seconds": 0.5,
+  "tail_percent": 0.5,
+  "source_wote_limits": {
+    "max_abs_magnitude_jerk_mps3": 8.37,
+    "max_abs_lateral_acceleration_mps2": 4.89,
+    "max_longitudinal_acceleration_mps2": 2.4,
+    "min_longitudinal_acceleration_mps2": -4.05,
+    "max_abs_yaw_acceleration_radps2": 1.93,
+    "max_abs_longitudinal_jerk_mps3": 4.13,
+    "max_abs_yaw_rate_radps": 0.95
+  },
+  "raw_training_quantile_limits": {
+    "min_longitudinal_acceleration_mps2": -1.6475700587034225,
+    "max_longitudinal_acceleration_mps2": 1.9997589886188507,
+    "max_abs_lateral_acceleration_mps2": 1.113738164305687,
+    "max_abs_magnitude_jerk_mps3": 1.5665514171123505,
+    "max_abs_longitudinal_jerk_mps3": 2.0167586505413055,
+    "max_abs_yaw_acceleration_radps2": 0.170600026845932,
+    "max_abs_yaw_rate_radps": 0.26857155188918114
+  },
+  "recommended_mining_limits": {
+    "min_longitudinal_acceleration_mps2": -1.65,
+    "max_longitudinal_acceleration_mps2": 2.0,
+    "max_abs_lateral_acceleration_mps2": 1.12,
+    "max_abs_magnitude_jerk_mps3": 1.57,
+    "max_abs_longitudinal_jerk_mps3": 2.02,
+    "max_abs_yaw_acceleration_radps2": 0.18,
+    "max_abs_yaw_rate_radps": 0.27
+  },
+  "recommended_training_comfortable_windows": 29078,
+  "recommended_training_comfortable_fraction": 0.9765583019881784,
+  "recommended_training_failed_by_component": [
+    296,
+    144,
+    149,
+    142,
+    135,
+    148
+  ]
+}

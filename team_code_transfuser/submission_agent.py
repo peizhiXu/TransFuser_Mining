@@ -32,6 +32,42 @@ def get_entry_point():
 
 
 class HybridAgent(autonomous_agent.AutonomousAgent):
+    def _make_config(self):
+        return GlobalConfig(setting='eval')
+
+    def _read_args(self, path_to_conf_file):
+        for name in ('args.txt', 'args.json'):
+            path = os.path.join(path_to_conf_file, name)
+            if os.path.isfile(path):
+                with open(path, 'r') as args_file:
+                    return json.load(args_file)
+        raise FileNotFoundError(
+            'checkpoint directory has neither args.txt nor args.json: %s'
+            % path_to_conf_file
+        )
+
+    def _checkpoint_files(self, path_to_conf_file):
+        return sorted(
+            file for file in os.listdir(path_to_conf_file)
+            if file.endswith('.pth')
+        )
+
+    def _build_network(self, image_architecture, lidar_architecture,
+                       use_velocity):
+        return LidarCenterNet(
+            self.config, self.device, self.backbone, image_architecture,
+            lidar_architecture, use_velocity
+        )
+
+    def _checkpoint_state_dict(self, checkpoint):
+        return checkpoint
+
+    def _strict_checkpoint_loading(self):
+        return False
+
+    def _configure_after_args(self):
+        pass
+
     def setup(self, path_to_conf_file, route_index=None):
         self.track = autonomous_agent.Track.SENSORS
         self.config_path = path_to_conf_file
@@ -43,12 +79,10 @@ class HybridAgent(autonomous_agent.AutonomousAgent):
         # cheap enough (no gradients) to fall back to CPU for those.
         self.device = os.environ.get('SUBMISSION_DEVICE', 'cuda')
 
-        args_file = open(os.path.join(path_to_conf_file, 'args.txt'), 'r')
-        self.args = json.load(args_file)
-        args_file.close()
+        self.args = self._read_args(path_to_conf_file)
 
         # setting machine to avoid loading files
-        self.config = GlobalConfig(setting='eval')
+        self.config = self._make_config()
         self.artifact_dir = None
         self.save_path = None
         if SAVE_PATH is not None:
@@ -99,8 +133,14 @@ class HybridAgent(autonomous_agent.AutonomousAgent):
             self.config.use_point_pillars = self.args['use_point_pillars']
         if ('n_layer' in self.args):
             self.config.n_layer = self.args['n_layer']
+        elif ('transformer_layers' in self.args):
+            self.config.n_layer = self.args['transformer_layers']
         if ('use_target_point_image' in self.args):
             self.config.use_target_point_image = bool(self.args['use_target_point_image'])
+        elif ('no_target_point_image' in self.args):
+            self.config.use_target_point_image = not bool(
+                self.args['no_target_point_image']
+            )
         if ('use_velocity' in self.args):
             use_velocity = bool(self.args['use_velocity'])
         else:
@@ -130,6 +170,7 @@ class HybridAgent(autonomous_agent.AutonomousAgent):
                 with (self.artifact_dir / 'run_metadata.json').open(
                         'w', encoding='utf-8') as metadata_file:
                     json.dump(metadata, metadata_file, indent=2)
+        self._configure_after_args()
 
         self.gps_buffer = deque(maxlen=self.config.gps_buffer_max_len) # Stores the last x updated gps signals.
         self.ego_model = EgoModel(dt=self.config.carla_frame_rate) # Bicycle model used for de-noising the GPS
@@ -142,22 +183,32 @@ class HybridAgent(autonomous_agent.AutonomousAgent):
         # Load model files
         self.nets = []
         self.model_count = 0 # Counts how many models are in our ensemble
-        for file in os.listdir(path_to_conf_file):
-            if file.endswith(".pth"):
-                self.model_count += 1
-                print(os.path.join(path_to_conf_file, file))
-                net = LidarCenterNet(self.config, self.device, self.backbone, image_architecture, lidar_architecture, use_velocity)
-                if(self.config.sync_batch_norm == True):
-                    net = torch.nn.SyncBatchNorm.convert_sync_batchnorm(net) # Model was trained with Sync. Batch Norm. Need to convert it otherwise parameters will load incorrectly.
-                state_dict = torch.load(os.path.join(path_to_conf_file, file), map_location=self.device)
-                # DDP checkpoints have a "module." prefix; single-GPU
-                # checkpoints do not.  Accept both without altering tensors.
-                if state_dict and all(k.startswith('module.') for k in state_dict):
-                    state_dict = {k[7:]: v for k, v in state_dict.items()}
-                net.load_state_dict(state_dict, strict=False)
-                net.to(self.device)
-                net.eval()
-                self.nets.append(net)
+        for file in self._checkpoint_files(path_to_conf_file):
+            self.model_count += 1
+            print(os.path.join(path_to_conf_file, file))
+            net = self._build_network(
+                image_architecture, lidar_architecture, use_velocity
+            )
+            if(self.config.sync_batch_norm == True):
+                net = torch.nn.SyncBatchNorm.convert_sync_batchnorm(net) # Model was trained with Sync. Batch Norm. Need to convert it otherwise parameters will load incorrectly.
+            checkpoint = torch.load(
+                os.path.join(path_to_conf_file, file), map_location=self.device
+            )
+            state_dict = self._checkpoint_state_dict(checkpoint)
+            # DDP checkpoints have a "module." prefix; single-GPU
+            # checkpoints do not.  Accept both without altering tensors.
+            if state_dict and all(k.startswith('module.') for k in state_dict):
+                state_dict = {k[7:]: v for k, v in state_dict.items()}
+            net.load_state_dict(
+                state_dict, strict=self._strict_checkpoint_loading()
+            )
+            net.to(self.device)
+            net.eval()
+            self.nets.append(net)
+        if self.model_count == 0:
+            raise FileNotFoundError(
+                'no model checkpoint found in %s' % path_to_conf_file
+            )
 
 
         self.stuck_detector = 0

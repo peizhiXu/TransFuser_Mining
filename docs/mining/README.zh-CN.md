@@ -61,4 +61,3 @@ bash leaderboard/scripts/evaluate_hd465_transfuser.sh
 ```
 
 源文件名中的 `yutian` 是历史命名；实验应以 XML 中实际的 CARLA weather 参数为准。
-

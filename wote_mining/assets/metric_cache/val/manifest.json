@@ -1,0 +1,562 @@
+{
+  "format_version": 1,
+  "split": "val",
+  "data_root": "/media/ubuntu/徐培智/dataset_transfuser_hd465/raw",
+  "assignments": "/home/ubuntu/projects/transfuser-wote/leaderboard/data/mining/split_v2/split_assignments.csv",
+  "assignments_sha256": "08937be7466a51c5bde849c4ca56f9bf64ab960f06e3a88f4c4080a4d72b3ea4",
+  "anchors": "/home/ubuntu/projects/transfuser-wote/wote_mining/assets/anchors/trajectory_anchors_256.npy",
+  "anchors_sha256": "54fd311b640bbffcbd739d8bfc3911f85e1c4fbb82eee602a12b65631ad79074",
+  "anchor_count": 256,
+  "metric_names": [
+    "no_collision",
+    "drivable_compliance",
+    "ego_progress",
+    "time_to_collision",
+    "comfort"
+  ],
+  "route_count": 20,
+  "frame_count": 5824,
+  "valid_counts": [
+    1490944,
+    1490944,
+    1456896,
+    1490944,
+    1490944
+  ],
+  "target_positive_counts": [
+    1479679,
+    1392051,
+    923218,
+    1480033,
+    1467648
+  ],
+  "target_sums": [
+    1479679.0,
+    1392051.0,
+    826624.4331054688,
+    1480033.0,
+    1467648.0
+  ],
+  "routes": {
+    "0325_3bangwan_route7_09_14_12_56_26": {
+      "file": "0325_3bangwan_route7_09_14_12_56_26.npz",
+      "frames": 100,
+      "valid_counts": [
+        25600,
+        25600,
+        25600,
+        25600,
+        25600
+      ],
+      "target_positive_counts": [
+        25596,
+        25036,
+        17139,
+        25596,
+        25200
+      ],
+      "target_sums": [
+        25596.0,
+        25036.0,
+        15334.9892578125,
+        25596.0,
+        25200.0
+      ],
+      "seconds": 3.263
+    },
+    "0325_3bangwan_route13_09_14_13_08_23": {
+      "file": "0325_3bangwan_route13_09_14_13_08_23.npz",
+      "frames": 51,
+      "valid_counts": [
+        13056,
+        13056,
+        12544,
+        13056,
+        13056
+      ],
+      "target_positive_counts": [
+        13055,
+        11750,
+        7590,
+        13055,
+        12852
+      ],
+      "target_sums": [
+        13055.0,
+        11750.0,
+        6744.93505859375,
+        13055.0,
+        12852.0
+      ],
+      "seconds": 1.654
+    },
+    "0325_3qingtian_route6_09_14_11_53_45": {
+      "file": "0325_3qingtian_route6_09_14_11_53_45.npz",
+      "frames": 25,
+      "valid_counts": [
+        6400,
+        6400,
+        5888,
+        6400,
+        6400
+      ],
+      "target_positive_counts": [
+        6398,
+        6272,
+        3932,
+        6398,
+        6300
+      ],
+      "target_sums": [
+        6398.0,
+        6272.0,
+        3533.23095703125,
+        6398.0,
+        6300.0
+      ],
+      "seconds": 0.832
+    },
+    "0325_3qingtian_route10_09_14_11_56_28": {
+      "file": "0325_3qingtian_route10_09_14_11_56_28.npz",
+      "frames": 232,
+      "valid_counts": [
+        59392,
+        59392,
+        59392,
+        59392,
+        59392
+      ],
+      "target_positive_counts": [
+        59390,
+        57226,
+        39099,
+        59389,
+        58464
+      ],
+      "target_sums": [
+        59390.0,
+        57226.0,
+        35036.40625,
+        59389.0,
+        58464.0
+      ],
+      "seconds": 6.788
+    },
+    "0325_3qingtian_route19_09_14_12_22_36": {
+      "file": "0325_3qingtian_route19_09_14_12_22_36.npz",
+      "frames": 231,
+      "valid_counts": [
+        59136,
+        59136,
+        59136,
+        59136,
+        59136
+      ],
+      "target_positive_counts": [
+        59136,
+        56380,
+        38620,
+        59136,
+        58212
+      ],
+      "target_sums": [
+        59136.0,
+        56380.0,
+        34540.78125,
+        59136.0,
+        58212.0
+      ],
+      "seconds": 6.751
+    },
+    "0325_3yutian_route4_09_14_13_47_44": {
+      "file": "0325_3yutian_route4_09_14_13_47_44.npz",
+      "frames": 245,
+      "valid_counts": [
+        62720,
+        62720,
+        62208,
+        62720,
+        62720
+      ],
+      "target_positive_counts": [
+        62720,
+        62311,
+        42042,
+        62720,
+        61740
+      ],
+      "target_sums": [
+        62720.0,
+        62311.0,
+        37830.421875,
+        62720.0,
+        61740.0
+      ],
+      "seconds": 6.496
+    },
+    "0325_3yutian_route10_09_14_14_06_55": {
+      "file": "0325_3yutian_route10_09_14_14_06_55.npz",
+      "frames": 190,
+      "valid_counts": [
+        48640,
+        48640,
+        47872,
+        48640,
+        48640
+      ],
+      "target_positive_counts": [
+        48635,
+        46579,
+        31199,
+        48635,
+        47880
+      ],
+      "target_sums": [
+        48635.0,
+        46579.0,
+        28051.306640625,
+        48635.0,
+        47880.0
+      ],
+      "seconds": 9.091
+    },
+    "0325_3yutian_route19_09_14_14_42_45": {
+      "file": "0325_3yutian_route19_09_14_14_42_45.npz",
+      "frames": 188,
+      "valid_counts": [
+        48128,
+        48128,
+        47360,
+        48128,
+        48128
+      ],
+      "target_positive_counts": [
+        48128,
+        42801,
+        28242,
+        48128,
+        47376
+      ],
+      "target_sums": [
+        48128.0,
+        42801.0,
+        25500.568359375,
+        48128.0,
+        47376.0
+      ],
+      "seconds": 5.915
+    },
+    "0325_4bangwan_route3_09_14_15_22_01": {
+      "file": "0325_4bangwan_route3_09_14_15_22_01.npz",
+      "frames": 67,
+      "valid_counts": [
+        17152,
+        17152,
+        16640,
+        17152,
+        17152
+      ],
+      "target_positive_counts": [
+        17002,
+        16986,
+        11336,
+        17001,
+        16884
+      ],
+      "target_sums": [
+        17002.0,
+        16986.0,
+        10049.8818359375,
+        17001.0,
+        16884.0
+      ],
+      "seconds": 2.233
+    },
+    "0325_4bangwan_route8_09_14_15_27_37": {
+      "file": "0325_4bangwan_route8_09_14_15_27_37.npz",
+      "frames": 88,
+      "valid_counts": [
+        22528,
+        22528,
+        22272,
+        22528,
+        22528
+      ],
+      "target_positive_counts": [
+        20102,
+        21488,
+        13372,
+        20031,
+        22176
+      ],
+      "target_sums": [
+        20102.0,
+        21488.0,
+        11709.146484375,
+        20031.0,
+        22176.0
+      ],
+      "seconds": 3.119
+    },
+    "0325_4qingtian_route2_09_14_14_51_13": {
+      "file": "0325_4qingtian_route2_09_14_14_51_13.npz",
+      "frames": 208,
+      "valid_counts": [
+        53248,
+        53248,
+        52736,
+        53248,
+        53248
+      ],
+      "target_positive_counts": [
+        53248,
+        50399,
+        34134,
+        53248,
+        52416
+      ],
+      "target_sums": [
+        53248.0,
+        50399.0,
+        30565.916015625,
+        53248.0,
+        52416.0
+      ],
+      "seconds": 7.078
+    },
+    "0325_4qingtian_route11_09_14_15_08_55": {
+      "file": "0325_4qingtian_route11_09_14_15_08_55.npz",
+      "frames": 174,
+      "valid_counts": [
+        44544,
+        44544,
+        44544,
+        44544,
+        44544
+      ],
+      "target_positive_counts": [
+        44543,
+        44544,
+        30930,
+        44542,
+        43848
+      ],
+      "target_sums": [
+        44543.0,
+        44544.0,
+        27363.478515625,
+        44542.0,
+        43848.0
+      ],
+      "seconds": 5.06
+    },
+    "0325_4yutian_route6_09_14_17_10_00": {
+      "file": "0325_4yutian_route6_09_14_17_10_00.npz",
+      "frames": 558,
+      "valid_counts": [
+        142848,
+        142848,
+        141056,
+        142848,
+        142848
+      ],
+      "target_positive_counts": [
+        140901,
+        133326,
+        89363,
+        141611,
+        140616
+      ],
+      "target_sums": [
+        140901.0,
+        133326.0,
+        80226.5078125,
+        141611.0,
+        140616.0
+      ],
+      "seconds": 20.487
+    },
+    "0325_4yutian_route11_09_14_17_26_00": {
+      "file": "0325_4yutian_route11_09_14_17_26_00.npz",
+      "frames": 77,
+      "valid_counts": [
+        19712,
+        19712,
+        19712,
+        19712,
+        19712
+      ],
+      "target_positive_counts": [
+        19711,
+        18898,
+        13239,
+        19711,
+        19404
+      ],
+      "target_sums": [
+        19711.0,
+        18898.0,
+        11599.6181640625,
+        19711.0,
+        19404.0
+      ],
+      "seconds": 2.643
+    },
+    "0325_5bangwan_route1_09_14_18_56_04": {
+      "file": "0325_5bangwan_route1_09_14_18_56_04.npz",
+      "frames": 140,
+      "valid_counts": [
+        35840,
+        35840,
+        27392,
+        35840,
+        35840
+      ],
+      "target_positive_counts": [
+        35173,
+        35281,
+        18230,
+        35145,
+        35280
+      ],
+      "target_sums": [
+        35173.0,
+        35281.0,
+        16212.986328125,
+        35145.0,
+        35280.0
+      ],
+      "seconds": 5.38
+    },
+    "0325_5bangwan_route4_09_14_19_10_49": {
+      "file": "0325_5bangwan_route4_09_14_19_10_49.npz",
+      "frames": 49,
+      "valid_counts": [
+        12544,
+        12544,
+        11520,
+        12544,
+        12544
+      ],
+      "target_positive_counts": [
+        12200,
+        10630,
+        6563,
+        12182,
+        12348
+      ],
+      "target_sums": [
+        12200.0,
+        10630.0,
+        5843.41845703125,
+        12182.0,
+        12348.0
+      ],
+      "seconds": 1.658
+    },
+    "0325_5bangwan_route11_09_14_19_22_20": {
+      "file": "0325_5bangwan_route11_09_14_19_22_20.npz",
+      "frames": 209,
+      "valid_counts": [
+        53504,
+        53504,
+        52992,
+        53504,
+        53504
+      ],
+      "target_positive_counts": [
+        53480,
+        41775,
+        27468,
+        53481,
+        52668
+      ],
+      "target_sums": [
+        53480.0,
+        41775.0,
+        24766.982421875,
+        53481.0,
+        52668.0
+      ],
+      "seconds": 6.764
+    },
+    "0325_5qingtian_route1_09_14_17_35_18": {
+      "file": "0325_5qingtian_route1_09_14_17_35_18.npz",
+      "frames": 2740,
+      "valid_counts": [
+        701440,
+        701440,
+        687616,
+        701440,
+        701440
+      ],
+      "target_positive_counts": [
+        695753,
+        648772,
+        431415,
+        695516,
+        690480
+      ],
+      "target_sums": [
+        695753.0,
+        648772.0,
+        386421.71875,
+        695516.0,
+        690480.0
+      ],
+      "seconds": 98.398
+    },
+    "0325_5qingtian_route16_09_14_18_49_11": {
+      "file": "0325_5qingtian_route16_09_14_18_49_11.npz",
+      "frames": 195,
+      "valid_counts": [
+        49920,
+        49920,
+        45824,
+        49920,
+        49920
+      ],
+      "target_positive_counts": [
+        49916,
+        47668,
+        29773,
+        49916,
+        49140
+      ],
+      "target_sums": [
+        49916.0,
+        47668.0,
+        26770.40234375,
+        49916.0,
+        49140.0
+      ],
+      "seconds": 6.691
+    },
+    "0325_5yutian_route6_09_14_19_57_12": {
+      "file": "0325_5yutian_route6_09_14_19_57_12.npz",
+      "frames": 57,
+      "valid_counts": [
+        14592,
+        14592,
+        14592,
+        14592,
+        14592
+      ],
+      "target_positive_counts": [
+        14592,
+        13929,
+        9532,
+        14592,
+        14364
+      ],
+      "target_sums": [
+        14592.0,
+        13929.0,
+        8521.736328125,
+        14592.0,
+        14364.0
+      ],
+      "seconds": 1.72
+    }
+  }
+}

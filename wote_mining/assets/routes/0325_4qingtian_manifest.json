@@ -1,0 +1,130 @@
+{
+  "format": "wote-mining-dense-routes-v1",
+  "route_xml": "/home/ubuntu/projects/transfuser-wote/leaderboard/data/mining/routes_final/0325_4qingtian.xml",
+  "xodr": "/home/ubuntu/carla_0.9.10_dirty/CARLA_0.9.10-dirty/CarlaUE4/Content/0325_4/Maps/0325_4/OpenDrive/0325_4.xodr",
+  "carla_root": "/home/ubuntu/carla_0.9.10_dirty/CARLA_0.9.10-dirty",
+  "hop_resolution_m": 1.0,
+  "construction": "leaderboard sparse XML to GlobalRoutePlanner trace",
+  "routes": {
+    "0": {
+      "collection_index": 0,
+      "xml_route_id": 1,
+      "town": "0325_4",
+      "file": "0325_4qingtian_index0_id1.npz",
+      "points": 311,
+      "length_m": 272.26910400390625
+    },
+    "1": {
+      "collection_index": 1,
+      "xml_route_id": 2,
+      "town": "0325_4",
+      "file": "0325_4qingtian_index1_id2.npz",
+      "points": 215,
+      "length_m": 146.51422119140625
+    },
+    "2": {
+      "collection_index": 2,
+      "xml_route_id": 3,
+      "town": "0325_4",
+      "file": "0325_4qingtian_index2_id3.npz",
+      "points": 597,
+      "length_m": 413.0599365234375
+    },
+    "3": {
+      "collection_index": 3,
+      "xml_route_id": 4,
+      "town": "0325_4",
+      "file": "0325_4qingtian_index3_id4.npz",
+      "points": 478,
+      "length_m": 360.02130126953125
+    },
+    "4": {
+      "collection_index": 4,
+      "xml_route_id": 5,
+      "town": "0325_4",
+      "file": "0325_4qingtian_index4_id5.npz",
+      "points": 400,
+      "length_m": 275.45745849609375
+    },
+    "5": {
+      "collection_index": 5,
+      "xml_route_id": 6,
+      "town": "0325_4",
+      "file": "0325_4qingtian_index5_id6.npz",
+      "points": 327,
+      "length_m": 245.1533203125
+    },
+    "6": {
+      "collection_index": 6,
+      "xml_route_id": 7,
+      "town": "0325_4",
+      "file": "0325_4qingtian_index6_id7.npz",
+      "points": 168,
+      "length_m": 94.73088836669922
+    },
+    "7": {
+      "collection_index": 7,
+      "xml_route_id": 8,
+      "town": "0325_4",
+      "file": "0325_4qingtian_index7_id8.npz",
+      "points": 289,
+      "length_m": 194.21302795410156
+    },
+    "8": {
+      "collection_index": 8,
+      "xml_route_id": 9,
+      "town": "0325_4",
+      "file": "0325_4qingtian_index8_id9.npz",
+      "points": 253,
+      "length_m": 173.2823486328125
+    },
+    "9": {
+      "collection_index": 9,
+      "xml_route_id": 10,
+      "town": "0325_4",
+      "file": "0325_4qingtian_index9_id10.npz",
+      "points": 289,
+      "length_m": 199.31723022460938
+    },
+    "10": {
+      "collection_index": 10,
+      "xml_route_id": 11,
+      "town": "0325_4",
+      "file": "0325_4qingtian_index10_id11.npz",
+      "points": 492,
+      "length_m": 367.75372314453125
+    },
+    "11": {
+      "collection_index": 11,
+      "xml_route_id": 12,
+      "town": "0325_4",
+      "file": "0325_4qingtian_index11_id12.npz",
+      "points": 476,
+      "length_m": 398.88055419921875
+    },
+    "12": {
+      "collection_index": 12,
+      "xml_route_id": 13,
+      "town": "0325_4",
+      "file": "0325_4qingtian_index12_id13.npz",
+      "points": 257,
+      "length_m": 151.95321655273438
+    },
+    "13": {
+      "collection_index": 13,
+      "xml_route_id": 14,
+      "town": "0325_4",
+      "file": "0325_4qingtian_index13_id14.npz",
+      "points": 242,
+      "length_m": 162.5434112548828
+    },
+    "14": {
+      "collection_index": 14,
+      "xml_route_id": 15,
+      "town": "0325_4",
+      "file": "0325_4qingtian_index14_id15.npz",
+      "points": 671,
+      "length_m": 387.193603515625
+    }
+  }
+}

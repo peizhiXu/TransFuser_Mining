@@ -20,6 +20,16 @@ class CARLA_Data(Dataset):
         self.seq_len = np.array(config.seq_len)
         assert (config.img_seq_len == 1)
         self.pred_len = np.array(config.pred_len)
+        # Only the WoTE mining configuration requests vehicle-frame 4 s poses.
+        # The original TransFuser dataset interface remains unchanged.
+        self.wote_future_poses = bool(getattr(config, 'wote_future_poses', False))
+        self.wote_future_scene_targets = bool(getattr(config, 'wote_future_scene_targets', False))
+        self.wote_dense_routes_dir = getattr(config, 'wote_dense_routes_dir', None)
+        self.wote_metric_cache_dir = getattr(config, 'wote_metric_cache_dir', None)
+        if self.wote_future_poses and (int(self.pred_len) != 8 or int(self.seq_len) != 1):
+            raise ValueError('WoTE mining targets require seq_len=1 and pred_len=8')
+        if self.wote_future_scene_targets and not self.wote_future_poses:
+            raise ValueError('future scene targets require WoTE future poses')
 
         self.img_resolution = np.array(config.img_resolution)
         self.img_width = np.array(config.img_width)
@@ -49,15 +59,40 @@ class CARLA_Data(Dataset):
         self.lidars = []
         self.labels = []
         self.measurements = []
+        self.wote_route_files = []
+        self.wote_metric_cache_files = []
+        self._wote_route_cache = {}
+        self._wote_metric_cache = {}
 
         for sub_root in tqdm(root, file=sys.stdout):
             sub_root = Path(sub_root)
 
-            # list sub-directories in root
-            root_files = os.listdir(sub_root)
-            routes = [folder for folder in root_files if not os.path.isfile(os.path.join(sub_root,folder))]
-            for route in routes:
-                route_dir = sub_root / route
+            # Existing callers pass directories containing route folders.
+            # WoTE may pass route folders directly so it can honor the cache
+            # train/val manifests without copying or symlinking the dataset.
+            if (sub_root / "lidar").is_dir():
+                route_dirs = [sub_root]
+            else:
+                root_files = os.listdir(sub_root)
+                route_dirs = [
+                    sub_root / folder for folder in root_files
+                    if not os.path.isfile(os.path.join(sub_root, folder))
+                ]
+            for route_dir in route_dirs:
+                if self.wote_dense_routes_dir:
+                    from wote_mining.WoTE_simulator import dense_route_file_for_collection
+                    wote_route_file = dense_route_file_for_collection(
+                        route_dir, self.wote_dense_routes_dir
+                    )
+                else:
+                    wote_route_file = None
+                if self.wote_metric_cache_dir:
+                    from wote_mining.WoTE_targets import metric_cache_file_for_collection
+                    wote_metric_cache_file = metric_cache_file_for_collection(
+                        route_dir, self.wote_metric_cache_dir
+                    )
+                else:
+                    wote_metric_cache_file = None
                 num_seq = len(os.listdir(route_dir / "lidar"))
 
                 # ignore the first two and last two frame
@@ -90,17 +125,32 @@ class CARLA_Data(Dataset):
                     self.lidars.append(lidar)
                     self.labels.append(label)
                     self.measurements.append(measurement)
+                    self.wote_route_files.append(wote_route_file)
+                    self.wote_metric_cache_files.append(wote_metric_cache_file)
 
         # There is a complex "memory leak"/performance issue when using Python objects like lists in a Dataloader that is loaded with multiprocessing, num_workers > 0
         # A summary of that ongoing discussion can be found here https://github.com/pytorch/pytorch/issues/13246#issuecomment-905703662
         # A workaround is to store the string lists as numpy byte objects because they only have 1 refcount.
-        self.images       = np.array(self.images      ).astype(np.string_)
-        self.bevs         = np.array(self.bevs        ).astype(np.string_)
-        self.depths       = np.array(self.depths      ).astype(np.string_)
-        self.semantics    = np.array(self.semantics   ).astype(np.string_)
-        self.lidars       = np.array(self.lidars      ).astype(np.string_)
-        self.labels       = np.array(self.labels      ).astype(np.string_)
-        self.measurements = np.array(self.measurements).astype(np.string_)
+        # Explicit UTF-8 keeps the original low-refcount byte-array workaround
+        # while supporting this dataset's Chinese mount path. ``astype(S)``
+        # implicitly uses ASCII and fails before the first training batch.
+        self.images = np.char.encode(np.asarray(self.images, dtype=str), 'utf-8')
+        self.bevs = np.char.encode(np.asarray(self.bevs, dtype=str), 'utf-8')
+        self.depths = np.char.encode(np.asarray(self.depths, dtype=str), 'utf-8')
+        self.semantics = np.char.encode(
+            np.asarray(self.semantics, dtype=str), 'utf-8'
+        )
+        self.lidars = np.char.encode(np.asarray(self.lidars, dtype=str), 'utf-8')
+        self.labels = np.char.encode(np.asarray(self.labels, dtype=str), 'utf-8')
+        self.measurements = np.char.encode(
+            np.asarray(self.measurements, dtype=str), 'utf-8'
+        )
+        if self.wote_dense_routes_dir:
+            self.wote_route_files = np.array(self.wote_route_files).astype(np.string_)
+        if self.wote_metric_cache_dir:
+            self.wote_metric_cache_files = np.array(
+                self.wote_metric_cache_files
+            ).astype(np.string_)
         print("Loading %d lidars from %d folders"%(len(self.lidars), len(root)))
 
     def __len__(self):
@@ -343,6 +393,115 @@ class CARLA_Data(Dataset):
         data['lidar'] = lidar_bev
         data['label'] = label_pad
         data['ego_waypoint'] = ego_waypoint
+        if self.wote_future_poses:
+            from wote_mining.WoTE_targets import future_ego_poses
+
+            ego_id = labels[0][0]['id']
+            ego_matrices = []
+            for frame_labels in labels:
+                ego_label = next((item for item in frame_labels if item['id'] == ego_id), None)
+                if ego_label is None:
+                    raise ValueError('ego vehicle missing from future labels')
+                ego_matrices.append(ego_label['ego_matrix'])
+            data['wote_future_poses'] = future_ego_poses(
+                ego_matrices, augmentation_degrees=degree
+            )
+            data['wote_augmentation_degrees'] = np.float32(degree)
+            if self.wote_dense_routes_dir:
+                from wote_mining.WoTE_simulator import local_route_window
+                route_path = str(self.wote_route_files[index], encoding='utf-8')
+                route_world_xy = self._wote_route_cache.get(route_path)
+                if route_world_xy is None:
+                    route_world_xy = np.load(route_path)['world_xy'].astype(np.float32)
+                    self._wote_route_cache[route_path] = route_world_xy
+                route_window = local_route_window(
+                    route_world_xy, ego_matrices[0],
+                    augmentation_degrees=degree,
+                )
+                data['wote_route_xy'] = route_window['route_xy']
+                data['wote_route_mask'] = route_window['route_mask']
+            if self.wote_metric_cache_dir:
+                from wote_mining.WoTE_targets import load_metric_cache_shard
+
+                cache_path = str(
+                    self.wote_metric_cache_files[index], encoding='utf-8'
+                )
+                cache = self._wote_metric_cache.get(cache_path)
+                if cache is None:
+                    cache = load_metric_cache_shard(cache_path)
+                    self._wote_metric_cache[cache_path] = cache
+                current_frame = int(Path(
+                    str(self.labels[index, 0], encoding='utf-8')
+                ).stem)
+                row = cache['frame_to_row'].get(current_frame)
+                if row is None:
+                    raise KeyError(
+                        'frame %d missing from metric cache %s'
+                        % (current_frame, cache_path)
+                    )
+                data['wote_metric_targets'] = cache[
+                    'metric_targets'
+                ][row].copy()
+                data['wote_metric_valid'] = cache['metric_valid'][row].copy()
+            if self.wote_future_scene_targets:
+                from wote_mining.WoTE_targets import (
+                    decode_topdown_scene, future_scene_targets,
+                )
+
+                future_label_path = Path(str(self.labels[index, -1], encoding='utf-8'))
+                future_topdown_path = (
+                    future_label_path.parent.parent / 'topdown'
+                    / ('encoded_%s.png' % future_label_path.stem)
+                )
+                future_topdown = cv2.imread(str(future_topdown_path), cv2.IMREAD_COLOR)
+                if future_topdown is None:
+                    raise FileNotFoundError(str(future_topdown_path))
+                future_scene = future_scene_targets(
+                    ego_matrices[0], ego_matrices[-1], future_topdown,
+                    labels[-1], lidar_x=float(self.lidar_pos[0]),
+                    augmentation_degrees=degree,
+                )
+                data['wote_future_scene'] = future_scene['scene']
+                data['wote_future_valid'] = future_scene['valid']
+                data['wote_future_agent_boxes'] = future_scene['agent_boxes']
+                data['wote_future_agent_mask'] = future_scene['agent_mask']
+                current_label_path = Path(str(self.labels[index, 0], encoding='utf-8'))
+                current_topdown_path = (
+                    current_label_path.parent.parent / 'topdown'
+                    / ('encoded_%s.png' % current_label_path.stem)
+                )
+                current_topdown = cv2.imread(str(current_topdown_path), cv2.IMREAD_COLOR)
+                if current_topdown is None:
+                    raise FileNotFoundError(str(current_topdown_path))
+                # Keep the full current road raster for candidate footprint
+                # evaluation. The 32 m forward LiDAR crop cuts off the rear
+                # of the HD465 at early future poses.
+                data['wote_current_road_full'] = decode_topdown_scene(
+                    current_topdown
+                )[0]
+                current_scene = future_scene_targets(
+                    ego_matrices[0], ego_matrices[0], current_topdown,
+                    labels[0], lidar_x=float(self.lidar_pos[0]),
+                    augmentation_degrees=degree,
+                )
+                data['wote_current_scene'] = current_scene['scene']
+                data['wote_current_valid'] = current_scene['valid']
+                data['wote_current_agent_boxes'] = current_scene['agent_boxes']
+                data['wote_current_agent_mask'] = current_scene['agent_mask']
+                from wote_mining.WoTE_targets import recorded_vehicle_tracks
+
+                recorded_tracks = recorded_vehicle_tracks(
+                    ego_matrices[0], labels, augmentation_degrees=degree,
+                )
+                data['wote_recorded_agent_boxes'] = recorded_tracks['boxes']
+                data['wote_recorded_agent_mask'] = recorded_tracks['mask']
+                data['wote_recorded_ego'] = recorded_tracks['recorded_ego']
+                data['wote_recording_radius_m'] = np.float32(
+                    recorded_tracks['recording_radius_m']
+                )
+                data['wote_recorded_agent_truncated'] = np.uint8(
+                    recorded_tracks['truncated']
+                )
 
         # other measurement
         # do you use the last frame that already happend or use the next frame?
