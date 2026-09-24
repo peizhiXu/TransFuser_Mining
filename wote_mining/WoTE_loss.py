@@ -68,14 +68,19 @@ def source_style_core_losses(outputs, future_poses, metric_targets=None,
             metric_logits, target, reduction="none"
         )
         if metric_valid is None:
-            losses["loss_metric_reward"] = elementwise.mean()
+            # Source WoTE adds the five independently averaged metric losses.
+            # Keeping the heads separate prevents a missing label in one head
+            # from changing the effective weight of every other head.
+            losses["loss_metric_reward"] = elementwise.mean(dim=(0, 1)).sum()
         else:
             if metric_valid.shape != metric_targets.shape:
                 raise ValueError("metric_valid must have shape [B,K,5]")
             valid = metric_valid.to(device=metric_logits.device, dtype=metric_logits.dtype)
+            valid_count = valid.sum(dim=(0, 1))
+            per_metric = (elementwise * valid).sum(dim=(0, 1)) / valid_count.clamp_min(1)
             losses["loss_metric_reward"] = (
-                (elementwise * valid).sum() / valid.sum().clamp_min(1)
-            )
+                per_metric * (valid_count > 0).to(per_metric.dtype)
+            ).sum()
     elif metric_valid is not None:
         raise ValueError("metric_valid requires metric_targets")
     return losses

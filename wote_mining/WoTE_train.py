@@ -17,7 +17,7 @@ import torch
 from torch import nn
 
 from wote_mining.WoTE_loss import source_style_core_losses
-from wote_mining.WoTE_model import current_semantic_map_loss
+from wote_mining.WoTE_model import METRIC_NAMES, current_semantic_map_loss
 
 
 class WoTEMiningTrainingModule(nn.Module):
@@ -62,6 +62,10 @@ class WoTEMiningTrainingModule(nn.Module):
             augmentation_degrees=batch["wote_augmentation_degrees"].float(),
             predict_future_map=True,
             future_map_candidate_indices=future_map_indices,
+            # Both train and validation targets were generated for the fixed
+            # 256 anchors.  Refined trajectories are used only by the online
+            # CARLA agent, matching the source WoTE train/eval split.
+            use_refined_world=False,
         )
 
     def compute_losses(self, batch, outputs):
@@ -104,6 +108,78 @@ class WoTEMiningTrainingModule(nn.Module):
             weighted[name] = value * float(weights[name])
         weighted["loss_total"] = sum(weighted.values())
         return weighted
+
+    @torch.no_grad()
+    def compute_diagnostics(self, batch, outputs):
+        """Return detached training diagnostics which never enter loss_total."""
+        logits = outputs["metric_logits"].float()
+        targets = batch["wote_metric_targets"].to(logits).float()
+        valid = batch["wote_metric_valid"].to(logits).float()
+        if logits.shape != targets.shape or logits.shape[-1] != len(METRIC_NAMES):
+            raise ValueError("metric diagnostic tensors have incompatible shapes")
+        if valid.shape != targets.shape:
+            raise ValueError("metric diagnostic validity has incompatible shape")
+
+        probabilities = torch.sigmoid(logits)
+        elementwise_bce = torch.nn.functional.binary_cross_entropy_with_logits(
+            logits, targets, reduction="none"
+        )
+        elementwise_mae = (probabilities - targets).abs()
+        diagnostics = {}
+        diagnostic_weights = {}
+        for metric_index, metric_name in enumerate(METRIC_NAMES):
+            metric_valid = valid[..., metric_index]
+            valid_count = metric_valid.sum()
+            denominator = valid_count.clamp_min(1.0)
+            prefix = "metric_%s" % metric_name
+            diagnostics[prefix + "_bce"] = (
+                elementwise_bce[..., metric_index] * metric_valid
+            ).sum() / denominator
+            diagnostics[prefix + "_mae"] = (
+                elementwise_mae[..., metric_index] * metric_valid
+            ).sum() / denominator
+            diagnostics[prefix + "_pred_mean"] = (
+                probabilities[..., metric_index] * metric_valid
+            ).sum() / denominator
+            diagnostics[prefix + "_target_mean"] = (
+                targets[..., metric_index] * metric_valid
+            ).sum() / denominator
+            diagnostics[prefix + "_valid_fraction"] = metric_valid.mean()
+            for suffix in ("_bce", "_mae", "_pred_mean", "_target_mean"):
+                diagnostic_weights[prefix + suffix] = valid_count
+            diagnostic_weights[prefix + "_valid_fraction"] = valid_count.new_tensor(
+                metric_valid.numel()
+            )
+
+        future = batch["wote_future_poses"].to(outputs["trajectories"]).float()
+        anchors = outputs["anchors"]
+        batch_size, candidate_count = anchors.shape[:2]
+        if future.shape != (batch_size, 8, 3):
+            raise ValueError("future pose diagnostics require shape [B,8,3]")
+        nearest = torch.linalg.vector_norm(
+            (anchors - future[:, None]).reshape(batch_size, candidate_count, -1),
+            dim=-1,
+        ).argmin(dim=1)
+        batch_index = torch.arange(batch_size, device=anchors.device)
+        matched_trajectory = outputs["trajectories"][batch_index, nearest]
+
+        # During training the reward labels correspond to fixed anchors. Use
+        # the selected anchor ID to inspect the refined trajectory that would
+        # be passed to the world model during online inference.
+        selected_index = outputs["selected_index"]
+        selected_trajectory = outputs["trajectories"][batch_index, selected_index]
+        for prefix, trajectory in (
+            ("traj_matched", matched_trajectory),
+            ("traj_selected", selected_trajectory),
+        ):
+            displacement = torch.linalg.vector_norm(
+                trajectory[..., :2] - future[..., :2], dim=-1
+            )
+            diagnostics[prefix + "_ade_m"] = displacement.mean()
+            diagnostics[prefix + "_fde_m"] = displacement[:, -1].mean()
+            diagnostic_weights[prefix + "_ade_m"] = future.new_tensor(batch_size)
+            diagnostic_weights[prefix + "_fde_m"] = future.new_tensor(batch_size)
+        return diagnostics, diagnostic_weights
 
 
 def build_optimizer(module, config):
@@ -212,6 +288,11 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--resume", default=None)
     parser.add_argument("--val-every", type=int, default=1)
+    parser.add_argument(
+        "--save-every", type=int, default=5,
+        help=("save a numbered checkpoint every N epochs and at the final "
+              "epoch; 0 disables periodic numbered checkpoints"),
+    )
     parser.add_argument("--max-train-batches", type=int, default=0)
     parser.add_argument("--max-val-batches", type=int, default=0)
     parser.add_argument(
@@ -293,10 +374,34 @@ def reduce_loss_sums(loss_sums, batches, device, distributed):
     return {name: values[index].item() / denominator for index, name in enumerate(names)}
 
 
+def reduce_weighted_sums(value_sums, weight_sums, device, distributed):
+    """Reduce detached diagnostic numerators and denominators across ranks."""
+    names = sorted(value_sums)
+    if set(names) != set(weight_sums):
+        raise ValueError("diagnostic values and weights must have the same names")
+    values = torch.tensor(
+        [value_sums[name] for name in names]
+        + [weight_sums[name] for name in names],
+        dtype=torch.float64, device=device,
+    )
+    if distributed:
+        dist.all_reduce(values, op=dist.ReduceOp.SUM)
+    split = len(names)
+    result = {}
+    for index, name in enumerate(names):
+        denominator = values[split + index].item()
+        result[name] = (
+            values[index].item() / denominator if denominator > 0.0 else 0.0
+        )
+    return result
+
+
 def run_epoch(model, loader, optimizer, scaler, device, config, epoch,
               training, distributed, rank, max_batches, grad_clip):
     model.train(training)
     loss_sums = {}
+    diagnostic_sums = {}
+    diagnostic_weight_sums = {}
     batches = 0
     iterator = tqdm(loader, disable=rank != 0, desc=("train" if training else "val"))
     context = torch.enable_grad if training else torch.no_grad
@@ -314,6 +419,7 @@ def run_epoch(model, loader, optimizer, scaler, device, config, epoch,
                 module = model.module if isinstance(model, DistributedDataParallel) else model
                 losses = module.compute_losses(batch, outputs)
                 total = losses["loss_total"]
+            diagnostics, diagnostic_weights = module.compute_diagnostics(batch, outputs)
             if training:
                 scaler.scale(total).backward()
                 if grad_clip > 0:
@@ -322,17 +428,40 @@ def run_epoch(model, loader, optimizer, scaler, device, config, epoch,
                 scaler.step(optimizer)
                 scaler.update()
             batches += 1
+            if set(losses).intersection(diagnostics):
+                raise RuntimeError("loss and diagnostic names must be disjoint")
             for name, value in losses.items():
                 loss_sums[name] = loss_sums.get(name, 0.0) + float(value.detach())
+            for name, value in diagnostics.items():
+                weight = float(diagnostic_weights[name].detach())
+                diagnostic_sums[name] = diagnostic_sums.get(name, 0.0) + (
+                    float(value.detach()) * weight
+                )
+                diagnostic_weight_sums[name] = (
+                    diagnostic_weight_sums.get(name, 0.0) + weight
+                )
             if rank == 0:
-                iterator.set_postfix(loss="%.4f" % float(total.detach()))
-    return reduce_loss_sums(loss_sums, batches, device, distributed)
+                iterator.set_postfix(
+                    loss="%.4f" % float(total.detach()),
+                    selected_ADE="%.2fm" % float(
+                        diagnostics["traj_selected_ade_m"].detach()
+                    ),
+                )
+    epoch_results = reduce_loss_sums(
+        loss_sums, batches, device, distributed
+    )
+    epoch_results.update(reduce_weighted_sums(
+        diagnostic_sums, diagnostic_weight_sums, device, distributed
+    ))
+    return epoch_results
 
 
-def save_checkpoint(path, model, optimizer, scaler, epoch, args, config):
+def save_checkpoint(path, model, optimizer, scaler, epoch, args, config,
+                    best_val_loss):
     module = model.module if isinstance(model, DistributedDataParallel) else model
     torch.save({
         "epoch": epoch,
+        "best_val_loss": best_val_loss,
         "model": module.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scaler": scaler.state_dict(),
@@ -357,6 +486,8 @@ def save_checkpoint(path, model, optimizer, scaler, epoch, args, config):
 
 def main():
     args = parse_args()
+    if args.save_every < 0:
+        raise ValueError("--save-every must be non-negative")
     distributed, rank, local_rank, world_size, device = distributed_context()
     seed_everything(args.seed, rank)
 
@@ -405,6 +536,7 @@ def main():
     scaler = torch.cuda.amp.GradScaler(enabled=bool(args.amp and device.type == "cuda"))
 
     start_epoch = 0
+    best_val_loss = float("inf")
     if args.resume:
         checkpoint = torch.load(args.resume, map_location=device)
         model.load_state_dict(checkpoint["model"])
@@ -412,6 +544,7 @@ def main():
         if "scaler" in checkpoint:
             scaler.load_state_dict(checkpoint["scaler"])
         start_epoch = int(checkpoint["epoch"]) + 1
+        best_val_loss = float(checkpoint.get("best_val_loss", float("inf")))
 
     if distributed:
         model = DistributedDataParallel(
@@ -469,6 +602,12 @@ def main():
                 False, distributed, rank, args.max_val_batches, args.grad_clip,
             )
         if rank == 0:
+            is_best = (
+                val_losses is not None
+                and val_losses["loss_total"] < best_val_loss
+            )
+            if is_best:
+                best_val_loss = val_losses["loss_total"]
             record = {
                 "epoch": epoch, "lr": learning_rate,
                 "train": train_losses, "val": val_losses,
@@ -477,13 +616,21 @@ def main():
             with (output_dir / "metrics.jsonl").open("a") as stream:
                 stream.write(json.dumps(record, ensure_ascii=False) + "\n")
             save_checkpoint(
-                output_dir / ("checkpoint_%03d.pth" % (epoch + 1)),
-                model, optimizer, scaler, epoch, args, config,
-            )
-            save_checkpoint(
                 output_dir / "latest.pth", model, optimizer, scaler,
-                epoch, args, config,
+                epoch, args, config, best_val_loss,
             )
+            periodic = args.save_every > 0 and (epoch + 1) % args.save_every == 0
+            final_epoch = (epoch + 1) == args.epochs
+            if periodic or final_epoch:
+                save_checkpoint(
+                    output_dir / ("checkpoint_%03d.pth" % (epoch + 1)),
+                    model, optimizer, scaler, epoch, args, config, best_val_loss,
+                )
+            if is_best:
+                save_checkpoint(
+                    output_dir / "best.pth", model, optimizer, scaler,
+                    epoch, args, config, best_val_loss,
+                )
         if distributed:
             dist.barrier()
 

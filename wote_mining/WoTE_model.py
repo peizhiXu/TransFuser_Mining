@@ -19,6 +19,37 @@ from torch.nn import functional as F
 BEV_SIDE = 8
 BEV_METERS = 32.0
 MAP_SIDE = 160
+SOURCE_FOCAL_ALPHA = 0.5
+SOURCE_FOCAL_GAMMA = 2.0
+
+
+def masked_sigmoid_focal_loss(logits, target, valid,
+                              alpha=SOURCE_FOCAL_ALPHA,
+                              gamma=SOURCE_FOCAL_GAMMA):
+    """Multi-label focal loss with WoTE's alpha/gamma and a spatial mask.
+
+    Source WoTE uses focal loss for semantic BEV supervision. Its NAVSIM map
+    is categorical, whereas the mining map layers may overlap, so this port
+    uses the sigmoid form rather than forcing them through a softmax.
+    """
+    if logits.shape != target.shape:
+        raise ValueError("focal logits and target must have identical shapes")
+    if not 0.0 <= alpha <= 1.0 or gamma < 0.0:
+        raise ValueError("focal alpha must be in [0,1] and gamma nonnegative")
+    truth = target.to(device=logits.device, dtype=logits.dtype)
+    mask = valid.to(device=logits.device, dtype=logits.dtype)
+    try:
+        mask = mask.expand_as(logits)
+    except RuntimeError as error:
+        raise ValueError("focal validity mask is not broadcastable to logits") from error
+    binary_ce = F.binary_cross_entropy_with_logits(
+        logits, truth, reduction="none"
+    )
+    probability = torch.sigmoid(logits)
+    probability_t = probability * truth + (1.0 - probability) * (1.0 - truth)
+    alpha_t = alpha * truth + (1.0 - alpha) * (1.0 - truth)
+    focal = alpha_t * (1.0 - probability_t).pow(gamma) * binary_ce
+    return (focal * mask).sum() / mask.sum().clamp_min(1)
 
 
 def vehicle_points_to_bev_grid(points, lidar_x=3.5, augmentation_degrees=None):
@@ -258,9 +289,7 @@ class WoTEMiningWorldModel(nn.Module):
         )
         if logits.shape != target.shape:
             raise ValueError("future_map_logits and targets have incompatible shapes")
-        loss = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
-        count = logits.shape[1]
-        return (loss * validity).sum() / (validity.sum() * count * 5).clamp_min(1)
+        return masked_sigmoid_focal_loss(logits, target, validity)
 
     def future_map_targets(self, trajectories, future_scene, future_valid,
                            augmentation_degrees=None):
@@ -568,15 +597,14 @@ class WoTEMiningAgentHead(nn.Module):
 
 
 def current_semantic_map_loss(logits, target, valid):
-    """Masked multi-label BCE for road, lane, vehicle, pedestrian layers."""
+    """Masked multi-label focal loss for the four current-scene layers."""
     if logits.ndim != 4 or logits.shape[1:] != (4, 160, 160):
         raise ValueError("current map logits must have shape [B,4,160,160]")
     if target.shape != logits.shape or valid.shape != (logits.shape[0], 160, 160):
         raise ValueError("current map target or validity mask has wrong shape")
     truth = target.to(device=logits.device, dtype=logits.dtype)
     mask = valid.to(device=logits.device, dtype=logits.dtype)[:, None]
-    loss = F.binary_cross_entropy_with_logits(logits, truth, reduction="none")
-    return (loss * mask).sum() / (mask.sum() * 4).clamp_min(1)
+    return masked_sigmoid_focal_loss(logits, truth, mask)
 
 """HD465 trajectory-query front end adapted from the WoTE design.
 
@@ -634,6 +662,26 @@ class WoTEMiningTrajectoryHead(nn.Module):
         nn.init.zeros_(self.offset_head.weight)
         nn.init.zeros_(self.offset_head.bias)
 
+    def encode_trajectory_features(self, trajectories, speed, target_point):
+        """Encode fixed or refined trajectories without BEV offset decoding.
+
+        Source WoTE uses fixed-anchor features to train its world/reward
+        models and re-encodes refined trajectories only for online inference.
+        Keeping this operation explicit prevents cached fixed-anchor labels
+        from being paired with a moving ``anchor + offset`` input.
+        """
+        batch, count = trajectories.shape[:2]
+        trajectory_features = self.anchor_context(
+            self.anchor_encoder(trajectories.flatten(2))
+        )
+        status = torch.cat((speed.reshape(batch, 1), target_point), dim=1)
+        status_feature = self.status_encoder(status).unsqueeze(1).expand(
+            -1, count, -1
+        )
+        return self.query_fusion(
+            torch.cat((trajectory_features, status_feature), dim=-1)
+        )
+
     def forward(self, fused_lidar, speed, target_point):
         if fused_lidar.ndim != 4 or fused_lidar.shape[1:] != (512, 8, 8):
             raise ValueError("fused_lidar must have shape [B,512,8,8]")
@@ -645,13 +693,10 @@ class WoTEMiningTrajectoryHead(nn.Module):
         bev_tokens = self.bev_downscale(fused_lidar).flatten(2).transpose(1, 2)
         bev_tokens = bev_tokens + self.bev_position.weight.unsqueeze(0)
         anchors = self.anchors.unsqueeze(0).expand(batch, -1, -1, -1)
-        anchor_queries = self.anchor_context(
-            self.anchor_encoder(anchors.flatten(2))
+        anchor_features = self.encode_trajectory_features(
+            anchors, speed, target_point
         )
-        status = torch.cat((speed, target_point), dim=1)
-        status_feature = self.status_encoder(status).unsqueeze(1).expand_as(anchor_queries)
-        queries = self.query_fusion(torch.cat((anchor_queries, status_feature), dim=-1))
-        decoded = self.offset_decoder(queries, bev_tokens)
+        decoded = self.offset_decoder(anchor_features, bev_tokens)
         offsets = self.offset_head(decoded).reshape_as(anchors)
         trajectories = anchors + offsets
         scores = self.score_head(decoded).squeeze(-1)
@@ -661,7 +706,8 @@ class WoTEMiningTrajectoryHead(nn.Module):
             "offsets": offsets,
             "trajectories": trajectories,
             "scores": scores,
-            "trajectory_features": decoded,
+            "anchor_features": anchor_features,
+            "offset_features": decoded,
         }
 
     @staticmethod
@@ -694,6 +740,19 @@ class WoTEMiningPlanner(nn.Module):
     def __init__(self, backbone, anchors_path):
         super().__init__()
         self.backbone = backbone
+        # These legacy TransFuser heads are downstream of the 8x8 fused LiDAR
+        # map consumed by WoTE.  Freezing them makes the WoTE computation graph
+        # valid under DDP without find_unused_parameters=True and also keeps
+        # them out of AdamW's state (roughly 6 MiB saved per checkpoint).
+        unused_output_heads = (
+            backbone.change_channel_conv_image,
+            backbone.c5_conv,
+            backbone.up_conv5,
+            backbone.up_conv4,
+            backbone.up_conv3,
+        )
+        for module in unused_output_heads:
+            module.requires_grad_(False)
         self.trajectory_head = WoTEMiningTrajectoryHead(anchors_path)
         self.world_model = WoTEMiningWorldModel(
             lidar_x=backbone.config.lidar_pos[0]
@@ -708,11 +767,10 @@ class WoTEMiningPlanner(nn.Module):
     def forward(self, rgb, lidar_bev, speed, target_point,
                 world_candidate_indices=None, augmentation_degrees=None,
                 predict_future_map=False, future_map_candidate_indices=None,
-                predict_auxiliary=True):
-        # Local backbone returns (FPN maps, camera map, pooled vector); its
-        # last FPN map is channel-reduced. WoTE needs the pre-FPN 512-channel
-        # fused LiDAR map, so the backbone exposes it explicitly below.
-        _, _, _, fused_lidar = self.backbone(
+                predict_auxiliary=True, use_refined_world=True):
+        # WoTE asks the local backbone for its fused 512x8x8 LiDAR map before
+        # the legacy TransFuser output heads.
+        fused_lidar = self.backbone(
             rgb, lidar_bev, speed, return_fused_lidar=True
         )
         result = self.trajectory_head(fused_lidar, speed, target_point)
@@ -722,9 +780,18 @@ class WoTEMiningPlanner(nn.Module):
             )
             result["current_map_logits"] = self.world_model.map_head(current_map)[:, :4]
             result.update(self.current_agent_head(result["bev_tokens"]))
+        if use_refined_world:
+            world_trajectories = result["trajectories"]
+            world_action_features = self.trajectory_head.encode_trajectory_features(
+                world_trajectories, speed, target_point
+            )
+        else:
+            # Training and validation labels are cached for the fixed anchors.
+            world_trajectories = result["anchors"]
+            world_action_features = result["anchor_features"]
         world = self.world_model(
-            result["bev_tokens"], result["trajectory_features"],
-            result["trajectories"], candidate_indices=world_candidate_indices,
+            result["bev_tokens"], world_action_features,
+            world_trajectories, candidate_indices=world_candidate_indices,
             augmentation_degrees=augmentation_degrees,
             predict_future_map=(
                 predict_future_map and future_map_candidate_indices is None
@@ -736,11 +803,11 @@ class WoTEMiningPlanner(nn.Module):
                 world, future_map_candidate_indices
             ))
         if world_candidate_indices is None:
-            scored_action_features = result["trajectory_features"]
+            scored_action_features = world_action_features
         else:
-            scored_action_features = result["trajectory_features"].gather(
+            scored_action_features = world_action_features.gather(
                 1, world_candidate_indices.unsqueeze(-1).expand(
-                    -1, -1, result["trajectory_features"].shape[-1]
+                    -1, -1, world_action_features.shape[-1]
                 )
             )
         rewards = self.reward_head(

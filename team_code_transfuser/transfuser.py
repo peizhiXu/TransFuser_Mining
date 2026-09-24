@@ -193,9 +193,17 @@ class TransfuserBackbone(nn.Module):
         image_features = image_features + image_features_layer4
         lidar_features = lidar_features + lidar_features_layer4
 
-        # Downsamples channels to 512
-        image_features = self.change_channel_conv_image(image_features)
+        # WoTE consumes only the fused spatial LiDAR branch.  Return before
+        # computing the legacy TransFuser camera/grid, pooling, and FPN heads.
+        # WoTEMiningPlanner freezes those unused output heads so DDP does not
+        # wait for gradients which can never be produced by this path.
         lidar_features = self.change_channel_conv_lidar(lidar_features)
+        if return_fused_lidar:
+            return lidar_features
+
+        # Downsamples the camera branch to 512 channels for the legacy
+        # TransFuser outputs.  The normal TransFuser path is unchanged.
+        image_features = self.change_channel_conv_image(image_features)
 
         x4 = lidar_features
         image_features_grid = image_features  # For auxilliary information
@@ -208,8 +216,6 @@ class TransfuserBackbone(nn.Module):
         fused_features = image_features + lidar_features
 
         features = self.top_down(x4)
-        if return_fused_lidar:
-            return features, image_features_grid, fused_features, x4
         return features, image_features_grid, fused_features
 
 
