@@ -296,6 +296,14 @@ def parse_args():
     parser.add_argument("--max-train-batches", type=int, default=0)
     parser.add_argument("--max-val-batches", type=int, default=0)
     parser.add_argument(
+        "--tensorboard", action="store_true",
+        help="write all train/validation metrics for TensorBoard",
+    )
+    parser.add_argument(
+        "--tensorboard-dir", default=None,
+        help="TensorBoard log directory (default: OUTPUT_DIR/tensorboard)",
+    )
+    parser.add_argument(
         "--amp", action="store_true", help="enable CUDA automatic mixed precision"
     )
     return parser.parse_args()
@@ -403,7 +411,13 @@ def run_epoch(model, loader, optimizer, scaler, device, config, epoch,
     diagnostic_sums = {}
     diagnostic_weight_sums = {}
     batches = 0
-    iterator = tqdm(loader, disable=rank != 0, desc=("train" if training else "val"))
+    progress_total = (
+        min(len(loader), max_batches) if max_batches else len(loader)
+    )
+    iterator = tqdm(
+        loader, total=progress_total, disable=rank != 0,
+        desc=("train" if training else "val"),
+    )
     context = torch.enable_grad if training else torch.no_grad
     with context():
         for batch_index, batch in enumerate(iterator):
@@ -482,6 +496,36 @@ def save_checkpoint(path, model, optimizer, scaler, epoch, args, config,
             },
         },
     }, path)
+
+
+def write_tensorboard_epoch(writer, epoch, learning_rate, train_metrics,
+                            val_metrics=None):
+    """Write one compact epoch record while retaining every scalar metric."""
+    step = int(epoch) + 1
+    writer.add_scalar("optimizer/learning_rate", float(learning_rate), step)
+    for name, value in train_metrics.items():
+        writer.add_scalar("train/%s" % name, float(value), step)
+    if val_metrics is not None:
+        for name, value in val_metrics.items():
+            writer.add_scalar("val/%s" % name, float(value), step)
+    writer.flush()
+
+
+def backfill_tensorboard(writer, metrics_path, before_epoch):
+    """Import completed JSONL epochs when TensorBoard is enabled on resume."""
+    if not metrics_path.is_file():
+        return
+    with metrics_path.open("r") as stream:
+        for line in stream:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            epoch = int(record["epoch"])
+            if epoch >= before_epoch:
+                continue
+            write_tensorboard_epoch(
+                writer, epoch, record["lr"], record["train"], record.get("val")
+            )
 
 
 def main():
@@ -579,10 +623,30 @@ def main():
     )
 
     output_dir = Path(args.output_dir)
+    writer = None
     if rank == 0:
         output_dir.mkdir(parents=True, exist_ok=True)
         with (output_dir / "args.json").open("w") as stream:
             json.dump(vars(args), stream, indent=2, ensure_ascii=False)
+        if args.tensorboard:
+            try:
+                from torch.utils.tensorboard import SummaryWriter
+            except ImportError as error:
+                raise RuntimeError(
+                    "TensorBoard is not installed; run: pip install tensorboard"
+                ) from error
+            tensorboard_dir = (
+                Path(args.tensorboard_dir)
+                if args.tensorboard_dir
+                else output_dir / "tensorboard"
+            )
+            writer = SummaryWriter(
+                log_dir=str(tensorboard_dir), purge_step=start_epoch + 1
+            )
+            backfill_tensorboard(
+                writer, output_dir / "metrics.jsonl", start_epoch
+            )
+            print("tensorboard_logdir=%s" % tensorboard_dir)
         print("device=%s world_size=%d train=%d val=%d" % (
             device, world_size, len(train_set), len(val_set)
         ))
@@ -612,9 +676,34 @@ def main():
                 "epoch": epoch, "lr": learning_rate,
                 "train": train_losses, "val": val_losses,
             }
-            print(json.dumps(record, ensure_ascii=False, sort_keys=True))
+            summary = (
+                "epoch=%03d/%03d lr=%.3e train_loss=%.4f "
+                "train_selected_ADE=%.2fm"
+                % (
+                    epoch + 1, args.epochs, learning_rate,
+                    train_losses["loss_total"],
+                    train_losses["traj_selected_ade_m"],
+                )
+            )
+            if val_losses is not None:
+                summary += (
+                    " val_loss=%.4f val_selected_ADE=%.2fm "
+                    "val_selected_FDE=%.2fm best_val=%.4f%s"
+                    % (
+                        val_losses["loss_total"],
+                        val_losses["traj_selected_ade_m"],
+                        val_losses["traj_selected_fde_m"],
+                        best_val_loss,
+                        " new_best" if is_best else "",
+                    )
+                )
+            print(summary, flush=True)
             with (output_dir / "metrics.jsonl").open("a") as stream:
                 stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+            if writer is not None:
+                write_tensorboard_epoch(
+                    writer, epoch, learning_rate, train_losses, val_losses
+                )
             save_checkpoint(
                 output_dir / "latest.pth", model, optimizer, scaler,
                 epoch, args, config, best_val_loss,
@@ -634,6 +723,8 @@ def main():
         if distributed:
             dist.barrier()
 
+    if writer is not None:
+        writer.close()
     if distributed:
         dist.destroy_process_group()
 

@@ -437,7 +437,17 @@ class LeaderboardEvaluator(object):
         os.environ['LEADERBOARD_ROUTE_NAME'] = config.name
         os.environ['LEADERBOARD_REPETITION'] = str(config.repetition_index)
         if int(os.environ['DATAGEN'])==1:
-            CarlaDataProvider._rng = random.RandomState(config.index)
+            # A single-route retry is re-indexed to zero, which used to force
+            # the exact same background spawn layout on every retry.  Allow a
+            # collection launcher to vary spawn locations independently from
+            # the Traffic Manager behaviour seed.  Full-batch collection keeps
+            # the original per-route index behaviour when the variable is not
+            # supplied.
+            spawn_seed = int(os.environ.get(
+                'BACKGROUND_SPAWN_SEED', config.index
+            ))
+            CarlaDataProvider._rng = random.RandomState(spawn_seed)
+            print('Background spawn-point seed: {}'.format(spawn_seed))
 
         # Set up the user's agent, and the timer to avoid freezing the simulation
         try:

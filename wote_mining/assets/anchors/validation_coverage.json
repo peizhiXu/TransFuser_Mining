@@ -6,133 +6,133 @@
   "matching_distance": "flattened 8 x (x, y, heading_weight * yaw), Euclidean",
   "heading_weight_m_per_rad": 1.0,
   "assignments_sha256": "08937be7466a51c5bde849c4ca56f9bf64ab960f06e3a88f4c4080a4d72b3ea4",
-  "anchors_sha256": "54fd311b640bbffcbd739d8bfc3911f85e1c4fbb82eee602a12b65631ad79074",
+  "anchors_sha256": "2fd15eafc5aa2ac539b6e9f0f83e82f2ebe132c43bcc49b443c238e4321ce421",
   "anchor_usage": {
     "used_anchors": 249,
     "unused_anchors": 7,
     "top_five_counts": [
-      312,
-      211,
-      209,
-      169,
-      162
+      317,
+      242,
+      203,
+      197,
+      176
     ]
   },
   "groups": {
     "all": {
       "count": 5924,
       "mean_step_position_error_m": {
-        "mean": 0.1513264775276184,
-        "median": 0.10242666304111481,
-        "p95": 0.44058802872896186,
-        "max": 1.9183504581451416
+        "mean": 0.15294310450553894,
+        "median": 0.10624175518751144,
+        "p95": 0.4653177946805954,
+        "max": 1.9482442140579224
       },
       "endpoint_position_error_m": {
-        "mean": 0.2753187417984009,
-        "median": 0.18024510145187378,
-        "p95": 0.8591527104377745,
-        "max": 4.373673439025879
+        "mean": 0.2741919755935669,
+        "median": 0.1859351098537445,
+        "p95": 0.8550603002309766,
+        "max": 3.798990488052368
       },
       "mean_step_yaw_error_deg": {
-        "mean": 0.7004000544548035,
-        "median": 0.37511181831359863,
-        "p95": 2.270198702812193,
-        "max": 15.618576049804688
+        "mean": 0.7146816849708557,
+        "median": 0.41069531440734863,
+        "p95": 2.2769101738929742,
+        "max": 11.186823844909668
       },
-      "endpoint_error_lt_1m_fraction": 0.9686022957461174,
-      "mean_step_error_lt_1m_fraction": 0.9974679270762998
+      "endpoint_error_lt_1m_fraction": 0.9669142471303174,
+      "mean_step_error_lt_1m_fraction": 0.9957798784604996
     },
     "near_stationary_endpoint_lt_1m": {
       "count": 7,
       "mean_step_position_error_m": {
-        "mean": 0.17216600477695465,
-        "median": 0.03842642903327942,
-        "p95": 0.5265213936567306,
-        "max": 0.5453351140022278
+        "mean": 0.8092015981674194,
+        "median": 0.8432422876358032,
+        "p95": 0.8766178369522095,
+        "max": 0.8810782432556152
       },
       "endpoint_position_error_m": {
-        "mean": 0.19399671256542206,
-        "median": 0.15295477211475372,
-        "p95": 0.543139314651489,
-        "max": 0.6597939133644104
+        "mean": 0.9019917249679565,
+        "median": 0.5586228370666504,
+        "p95": 2.08072634935379,
+        "max": 2.183839797973633
       },
       "mean_step_yaw_error_deg": {
-        "mean": 0.3632113039493561,
-        "median": 0.03960958868265152,
-        "p95": 1.6131777763366686,
-        "max": 2.2320199012756348
+        "mean": 0.7614580988883972,
+        "median": 0.49371135234832764,
+        "p95": 2.0287787914276105,
+        "max": 2.679795980453491
       },
-      "endpoint_error_lt_1m_fraction": 1.0,
+      "endpoint_error_lt_1m_fraction": 0.7142857142857143,
       "mean_step_error_lt_1m_fraction": 1.0
     },
     "turn_abs_final_yaw_ge_0p2rad": {
       "count": 819,
       "mean_step_position_error_m": {
-        "mean": 0.29829445481300354,
-        "median": 0.24081934988498688,
-        "p95": 0.6920872509479516,
-        "max": 1.9183504581451416
+        "mean": 0.2926735281944275,
+        "median": 0.230226069688797,
+        "p95": 0.7176256656646712,
+        "max": 1.8113898038864136
       },
       "endpoint_position_error_m": {
-        "mean": 0.5509422421455383,
-        "median": 0.43889230489730835,
-        "p95": 1.4584934830665583,
-        "max": 4.373673439025879
+        "mean": 0.532446026802063,
+        "median": 0.4181993007659912,
+        "p95": 1.3997829437255838,
+        "max": 3.798990488052368
       },
       "mean_step_yaw_error_deg": {
-        "mean": 1.594735860824585,
-        "median": 1.2896246910095215,
-        "p95": 3.9797851324081335,
-        "max": 15.618576049804688
+        "mean": 1.6688278913497925,
+        "median": 1.3528058528900146,
+        "p95": 4.407777261734007,
+        "max": 11.186823844909668
       },
-      "endpoint_error_lt_1m_fraction": 0.8913308913308914,
-      "mean_step_error_lt_1m_fraction": 0.9865689865689866
+      "endpoint_error_lt_1m_fraction": 0.8937728937728938,
+      "mean_step_error_lt_1m_fraction": 0.978021978021978
     },
     "large_lateral_abs_final_y_ge_2m": {
       "count": 830,
       "mean_step_position_error_m": {
-        "mean": 0.31215348839759827,
-        "median": 0.26300758123397827,
-        "p95": 0.6948988229036328,
-        "max": 1.9183504581451416
+        "mean": 0.3127962648868561,
+        "median": 0.24887612462043762,
+        "p95": 0.7394313097000117,
+        "max": 1.8113898038864136
       },
       "endpoint_position_error_m": {
-        "mean": 0.5717142820358276,
-        "median": 0.4773448705673218,
-        "p95": 1.438760113716125,
-        "max": 4.373673439025879
+        "mean": 0.558756947517395,
+        "median": 0.45241257548332214,
+        "p95": 1.4109845995903003,
+        "max": 3.798990488052368
       },
       "mean_step_yaw_error_deg": {
-        "mean": 1.6307897567749023,
-        "median": 1.3450942039489746,
-        "p95": 3.8999618291854845,
-        "max": 14.328742027282715
+        "mean": 1.6602426767349243,
+        "median": 1.3368785381317139,
+        "p95": 4.225436758995054,
+        "max": 10.266454696655273
       },
-      "endpoint_error_lt_1m_fraction": 0.8903614457831325,
-      "mean_step_error_lt_1m_fraction": 0.9867469879518073
+      "endpoint_error_lt_1m_fraction": 0.8783132530120482,
+      "mean_step_error_lt_1m_fraction": 0.9771084337349397
     },
     "other": {
       "count": 4945,
       "mean_step_position_error_m": {
-        "mean": 0.1215737834572792,
-        "median": 0.08264830708503723,
-        "p95": 0.36940232515335086,
-        "max": 1.4383702278137207
+        "mean": 0.12305401265621185,
+        "median": 0.08967190980911255,
+        "p95": 0.36520266532897955,
+        "max": 1.9482442140579224
       },
       "endpoint_position_error_m": {
-        "mean": 0.22142034769058228,
-        "median": 0.1492535024881363,
-        "p95": 0.6931023478508,
-        "max": 3.6947927474975586
+        "mean": 0.22138656675815582,
+        "median": 0.15662077069282532,
+        "p95": 0.6942579269409184,
+        "max": 3.5579092502593994
       },
       "mean_step_yaw_error_deg": {
-        "mean": 0.5268309712409973,
-        "median": 0.3074568808078766,
-        "p95": 1.7661692142486576,
-        "max": 6.452494144439697
+        "mean": 0.531580924987793,
+        "median": 0.31658777594566345,
+        "p95": 1.7397181510925295,
+        "max": 6.508038520812988
       },
-      "endpoint_error_lt_1m_fraction": 0.9824064711830132,
-      "mean_step_error_lt_1m_fraction": 0.9993933265925177
+      "endpoint_error_lt_1m_fraction": 0.9822042467138524,
+      "mean_step_error_lt_1m_fraction": 0.9989888776541962
     }
   },
   "routes_by_mean_endpoint_error_desc": [
@@ -140,141 +140,141 @@
       "route": "0325_3bangwan_route13_09_14_13_08_23",
       "frames": 64,
       "windows": 56,
-      "mean_endpoint_error_m": 0.9063946604728699,
-      "p95_endpoint_error_m": 2.3518282771110535
+      "mean_endpoint_error_m": 0.9234164357185364,
+      "p95_endpoint_error_m": 2.5233606696128845
     },
     {
       "route": "0325_5bangwan_route11_09_14_19_22_20",
       "frames": 222,
       "windows": 214,
-      "mean_endpoint_error_m": 0.5630698800086975,
-      "p95_endpoint_error_m": 1.2670024037361127
-    },
-    {
-      "route": "0325_4bangwan_route8_09_14_15_27_37",
-      "frames": 101,
-      "windows": 93,
-      "mean_endpoint_error_m": 0.5105065107345581,
-      "p95_endpoint_error_m": 1.0832830429077147
-    },
-    {
-      "route": "0325_5bangwan_route4_09_14_19_10_49",
-      "frames": 62,
-      "windows": 54,
-      "mean_endpoint_error_m": 0.49151313304901123,
-      "p95_endpoint_error_m": 1.2409155845642088
+      "mean_endpoint_error_m": 0.5536171793937683,
+      "p95_endpoint_error_m": 1.3188314616680143
     },
     {
       "route": "0325_4yutian_route11_09_14_17_26_00",
       "frames": 90,
       "windows": 82,
-      "mean_endpoint_error_m": 0.43779680132865906,
-      "p95_endpoint_error_m": 1.2027366399765016
+      "mean_endpoint_error_m": 0.4762195944786072,
+      "p95_endpoint_error_m": 1.1360540390014648
+    },
+    {
+      "route": "0325_4bangwan_route8_09_14_15_27_37",
+      "frames": 101,
+      "windows": 93,
+      "mean_endpoint_error_m": 0.4622761607170105,
+      "p95_endpoint_error_m": 0.9863523364067077
     },
     {
       "route": "0325_4bangwan_route3_09_14_15_22_01",
       "frames": 80,
       "windows": 72,
-      "mean_endpoint_error_m": 0.3919355571269989,
-      "p95_endpoint_error_m": 0.8210118979215625
+      "mean_endpoint_error_m": 0.4545457661151886,
+      "p95_endpoint_error_m": 0.9588447302579882
+    },
+    {
+      "route": "0325_5bangwan_route4_09_14_19_10_49",
+      "frames": 62,
+      "windows": 54,
+      "mean_endpoint_error_m": 0.44648629426956177,
+      "p95_endpoint_error_m": 1.107653784751892
     },
     {
       "route": "0325_5yutian_route6_09_14_19_57_12",
       "frames": 70,
       "windows": 62,
-      "mean_endpoint_error_m": 0.35844531655311584,
-      "p95_endpoint_error_m": 0.9115617692470546
-    },
-    {
-      "route": "0325_4qingtian_route11_09_14_15_08_55",
-      "frames": 187,
-      "windows": 179,
-      "mean_endpoint_error_m": 0.3526628315448761,
-      "p95_endpoint_error_m": 0.8608095228672025
+      "mean_endpoint_error_m": 0.37998658418655396,
+      "p95_endpoint_error_m": 1.0929722547531124
     },
     {
       "route": "0325_5bangwan_route1_09_14_18_56_04",
       "frames": 153,
       "windows": 145,
-      "mean_endpoint_error_m": 0.3214312195777893,
-      "p95_endpoint_error_m": 1.02160542011261
+      "mean_endpoint_error_m": 0.3457167148590088,
+      "p95_endpoint_error_m": 1.1439620971679667
+    },
+    {
+      "route": "0325_4qingtian_route11_09_14_15_08_55",
+      "frames": 187,
+      "windows": 179,
+      "mean_endpoint_error_m": 0.33310553431510925,
+      "p95_endpoint_error_m": 0.9486088931560516
     },
     {
       "route": "0325_3qingtian_route6_09_14_11_53_45",
       "frames": 38,
       "windows": 30,
-      "mean_endpoint_error_m": 0.306707501411438,
-      "p95_endpoint_error_m": 0.8380138128995887
-    },
-    {
-      "route": "0325_4qingtian_route2_09_14_14_51_13",
-      "frames": 221,
-      "windows": 213,
-      "mean_endpoint_error_m": 0.29696786403656006,
-      "p95_endpoint_error_m": 0.9495283007621761
+      "mean_endpoint_error_m": 0.304634153842926,
+      "p95_endpoint_error_m": 0.6038379549980163
     },
     {
       "route": "0325_5qingtian_route1_09_14_17_35_18",
       "frames": 2753,
       "windows": 2745,
-      "mean_endpoint_error_m": 0.2737576365470886,
-      "p95_endpoint_error_m": 0.8306819438934323
+      "mean_endpoint_error_m": 0.27819570899009705,
+      "p95_endpoint_error_m": 0.807776141166685
     },
     {
-      "route": "0325_3qingtian_route19_09_14_12_22_36",
-      "frames": 244,
-      "windows": 236,
-      "mean_endpoint_error_m": 0.2602398097515106,
-      "p95_endpoint_error_m": 0.724059209227562
-    },
-    {
-      "route": "0325_3yutian_route19_09_14_14_42_45",
-      "frames": 201,
-      "windows": 193,
-      "mean_endpoint_error_m": 0.23751036822795868,
-      "p95_endpoint_error_m": 0.620578813552856
+      "route": "0325_4qingtian_route2_09_14_14_51_13",
+      "frames": 221,
+      "windows": 213,
+      "mean_endpoint_error_m": 0.2711748778820038,
+      "p95_endpoint_error_m": 0.8732127189636224
     },
     {
       "route": "0325_3bangwan_route7_09_14_12_56_26",
       "frames": 113,
       "windows": 105,
-      "mean_endpoint_error_m": 0.23683391511440277,
-      "p95_endpoint_error_m": 0.6162002444267273
+      "mean_endpoint_error_m": 0.2522399127483368,
+      "p95_endpoint_error_m": 0.6621131777763364
+    },
+    {
+      "route": "0325_3qingtian_route19_09_14_12_22_36",
+      "frames": 244,
+      "windows": 236,
+      "mean_endpoint_error_m": 0.24166586995124817,
+      "p95_endpoint_error_m": 0.7803956866264343
     },
     {
       "route": "0325_3yutian_route10_09_14_14_06_55",
       "frames": 203,
       "windows": 195,
-      "mean_endpoint_error_m": 0.22950886189937592,
-      "p95_endpoint_error_m": 0.6083830595016477
+      "mean_endpoint_error_m": 0.23355959355831146,
+      "p95_endpoint_error_m": 0.5835453927516936
+    },
+    {
+      "route": "0325_3yutian_route19_09_14_14_42_45",
+      "frames": 201,
+      "windows": 193,
+      "mean_endpoint_error_m": 0.22554168105125427,
+      "p95_endpoint_error_m": 0.6912703990936272
     },
     {
       "route": "0325_5qingtian_route16_09_14_18_49_11",
       "frames": 208,
       "windows": 200,
-      "mean_endpoint_error_m": 0.21288347244262695,
-      "p95_endpoint_error_m": 0.3810127064585678
-    },
-    {
-      "route": "0325_3yutian_route4_09_14_13_47_44",
-      "frames": 258,
-      "windows": 250,
-      "mean_endpoint_error_m": 0.18973775207996368,
-      "p95_endpoint_error_m": 0.6814851045608514
+      "mean_endpoint_error_m": 0.22178100049495697,
+      "p95_endpoint_error_m": 0.3364112854003898
     },
     {
       "route": "0325_3qingtian_route10_09_14_11_56_28",
       "frames": 245,
       "windows": 237,
-      "mean_endpoint_error_m": 0.18948383629322052,
-      "p95_endpoint_error_m": 0.5158187627792352
+      "mean_endpoint_error_m": 0.17542359232902527,
+      "p95_endpoint_error_m": 0.5173160791397093
+    },
+    {
+      "route": "0325_3yutian_route4_09_14_13_47_44",
+      "frames": 258,
+      "windows": 250,
+      "mean_endpoint_error_m": 0.16655384004116058,
+      "p95_endpoint_error_m": 0.6496087282896038
     },
     {
       "route": "0325_4yutian_route6_09_14_17_10_00",
       "frames": 571,
       "windows": 563,
-      "mean_endpoint_error_m": 0.09577451646327972,
-      "p95_endpoint_error_m": 0.16546983122825618
+      "mean_endpoint_error_m": 0.09098771214485168,
+      "p95_endpoint_error_m": 0.14393613934516908
     }
   ]
 }

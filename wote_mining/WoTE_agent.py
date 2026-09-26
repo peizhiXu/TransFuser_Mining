@@ -1,6 +1,7 @@
 """Closed-loop inference wrapper and HD465 trajectory controller for WoTE."""
 
 from collections import deque
+import json
 import sys
 from pathlib import Path
 
@@ -8,12 +9,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import cv2
 import numpy as np
 import torch
 from torch import nn
 
 from team_code_transfuser.transfuser import TransfuserBackbone
-from wote_mining.WoTE_model import WoTEMiningPlanner
+from wote_mining.WoTE_model import METRIC_NAMES, WoTEMiningPlanner
 
 
 class PIDController(object):
@@ -123,9 +125,144 @@ class WoTEMiningInferenceModel(nn.Module):
         self.config = config
         self.controller = HD465TrajectoryController(config)
         self.last_diagnostics = {}
+        self.debug_step = 0
+        self._pending_debug = None
+
+    @staticmethod
+    def _uint8_image(image):
+        image = np.asarray(image)
+        if image.size and float(image.max()) <= 1.0:
+            image = image * 255.0
+        return np.clip(image, 0.0, 255.0).astype(np.uint8)
+
+    def _cache_debug_frame(self, rgb, lidar_bev, target_point, selected,
+                           ego_vel, save_path, stuck_detector, forced_move):
+        rgb_image = rgb[0].detach().float().cpu().permute(1, 2, 0).numpy()
+        self._pending_debug = {
+            "rgb": self._uint8_image(rgb_image)[:, :, ::-1],
+            "lidar": lidar_bev[0, :2].detach().float().cpu().numpy(),
+            "target_point": target_point[0].detach().float().cpu().numpy(),
+            "trajectory": selected[0, :, :2].detach().float().cpu().numpy(),
+            "speed": float(ego_vel.reshape(-1)[0].detach().cpu()),
+            "save_path": str(save_path),
+            "frame": self.debug_step // 2,
+            "stuck_detector": int(stuck_detector),
+            "forced_move": bool(forced_move),
+            "diagnostics": dict(self.last_diagnostics),
+        }
+
+    def save_debug_frame(self, telemetry):
+        data = self._pending_debug
+        self._pending_debug = None
+        if data is None:
+            return
+
+        lidar = np.clip(data["lidar"], 0.0, 1.0)
+        bev = np.zeros((256, 256, 3), dtype=np.uint8)
+        # Low/ground returns are green; high/obstacle returns are red.
+        bev[:, :, 1] = (lidar[1] * 210.0).astype(np.uint8)
+        bev[:, :, 2] = (lidar[0] * 255.0).astype(np.uint8)
+        for pixel in range(0, 257, 32):
+            coordinate = min(pixel, 255)
+            cv2.line(bev, (coordinate, 0), (coordinate, 255), (45, 45, 45), 1)
+            cv2.line(bev, (0, coordinate), (255, coordinate), (45, 45, 45), 1)
+
+        pixels_per_meter = float(self.config.pixels_per_meter)
+        lidar_x = float(self.config.lidar_pos[0])
+
+        def metric_to_pixel(point):
+            forward = float(point[0]) - lidar_x
+            right = float(point[1])
+            return (
+                int(round(128.0 + right * pixels_per_meter)),
+                int(round(256.0 - forward * pixels_per_meter)),
+            )
+
+        previous = None
+        for index, point in enumerate(data["trajectory"]):
+            pixel = metric_to_pixel(point)
+            if 0 <= pixel[0] < 256 and 0 <= pixel[1] < 256:
+                if previous is not None:
+                    cv2.line(bev, previous, pixel, (255, 255, 255), 2)
+                previous = pixel
+                cv2.circle(bev, pixel, 4, (255, 255, 255), -1)
+                cv2.putText(
+                    bev, str(index + 1), (pixel[0] + 4, pixel[1] - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1,
+                    cv2.LINE_AA,
+                )
+
+        target_pixel = metric_to_pixel(data["target_point"])
+        if 0 <= target_pixel[0] < 256 and 0 <= target_pixel[1] < 256:
+            cv2.drawMarker(
+                bev, target_pixel, (0, 255, 255), cv2.MARKER_CROSS, 12, 2
+            )
+        cv2.circle(bev, (128, 255), 5, (255, 255, 0), -1)
+        cv2.putText(
+            bev, "LiDAR BEV / selected 4 s trajectory", (7, 18),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.43, (255, 255, 255), 1,
+            cv2.LINE_AA,
+        )
+
+        bev_panel = cv2.resize(bev, (384, 384), interpolation=cv2.INTER_NEAREST)
+        info = np.full((384, 576, 3), 24, dtype=np.uint8)
+        diagnostics = data["diagnostics"]
+        metrics = diagnostics.get("selected_metric_scores", [])
+        lines = [
+            "WoTE HD465 closed-loop",
+            "frame: %d" % data["frame"],
+            "anchor: %s" % diagnostics.get("selected_anchor_index", "n/a"),
+            "reward: %.5f" % diagnostics.get("selected_reward", float("nan")),
+            "speed: %.2f m/s   desired: %.2f m/s" % (
+                data["speed"], telemetry.get("desired_speed", float("nan"))
+            ),
+            "steer: %+.3f   throttle: %.3f   brake: %.3f" % (
+                telemetry.get("steer", float("nan")),
+                telemetry.get("throttle", float("nan")),
+                telemetry.get("brake", float("nan")),
+            ),
+            "target: (%.2f, %.2f) m" % tuple(data["target_point"][:2]),
+            "stuck: %d   recovery: %s" % (
+                data["stuck_detector"], data["forced_move"]
+            ),
+            "metric rewards:",
+        ]
+        for name, value in zip(METRIC_NAMES, metrics):
+            lines.append("  %-21s %.4f" % (name, value))
+        for line_index, line in enumerate(lines):
+            color = (90, 220, 255) if line_index == 0 else (235, 235, 235)
+            cv2.putText(
+                info, line, (18, 26 + line_index * 25),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.57, color, 1, cv2.LINE_AA,
+            )
+
+        lower = np.concatenate((bev_panel, info), axis=1)
+        rgb_panel = cv2.resize(
+            data["rgb"], (960, 218), interpolation=cv2.INTER_AREA
+        )
+        cv2.putText(
+            rgb_panel, "left / front / right camera panorama", (12, 22),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1,
+            cv2.LINE_AA,
+        )
+        composite = np.concatenate((rgb_panel, lower), axis=0)
+        save_path = Path(data["save_path"])
+        save_path.mkdir(parents=True, exist_ok=True)
+        output = save_path / ("%06d.png" % data["frame"])
+        try:
+            written = cv2.imwrite(
+                str(output), composite, [cv2.IMWRITE_PNG_COMPRESSION, 2]
+            )
+            if not written:
+                print("WARNING: failed to write WoTE debug frame: %s" % output)
+        except (OSError, cv2.error) as error:
+            print("WARNING: failed to write WoTE debug frame %s: %s" % (
+                output, error
+            ))
 
     def forward_ego(self, rgb, lidar_bev, target_point, target_point_image,
                     ego_vel, **kwargs):
+        lidar_visual = lidar_bev
         if self.config.use_target_point_image:
             lidar_bev = torch.cat((lidar_bev, target_point_image), dim=1)
         outputs = self.planner(
@@ -148,6 +285,16 @@ class WoTEMiningInferenceModel(nn.Module):
                 float(value) for value in selected_metrics[0].detach().cpu()
             ],
         }
+        self.debug_step += 1
+        if (kwargs.get("debug", False) and kwargs.get("save_path") is not None
+                and self.debug_step % 2 == 0):
+            self._cache_debug_frame(
+                rgb, lidar_visual, target_point, selected, ego_vel,
+                kwargs["save_path"], kwargs.get("stuck_detector", 0),
+                kwargs.get("forced_move", False),
+            )
+        else:
+            self._pending_debug = None
         return selected[..., :2], []
 
     def control_pid(self, waypoints, velocity, is_stuck, pitch=0.0):
@@ -166,7 +313,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from submission_agent import HybridAgent
+from team_code_transfuser.submission_agent import HybridAgent
 from wote_mining.WoTE_config import WoTEMiningConfig
 
 
@@ -186,6 +333,20 @@ class WoTEMiningAgent(HybridAgent):
         if self.config.use_point_pillars:
             raise ValueError('WoTE mining Agent currently requires histogram LiDAR BEV')
         self.config.multitask = False
+
+    def setup(self, path_to_conf_file, route_index=None):
+        super().setup(path_to_conf_file, route_index=route_index)
+        if self.artifact_dir is not None:
+            metadata_path = self.artifact_dir / 'run_metadata.json'
+            if metadata_path.is_file():
+                with metadata_path.open('r', encoding='utf-8') as stream:
+                    metadata = json.load(stream)
+                metadata['composite_contents'] = [
+                    'rgb_panorama', 'lidar_bev', 'selected_trajectory',
+                    'selected_anchor', 'reward_metrics', 'vehicle_control',
+                ]
+                with metadata_path.open('w', encoding='utf-8') as stream:
+                    json.dump(metadata, stream, indent=2)
 
     def _checkpoint_files(self, path_to_conf_file):
         requested = os.environ.get('WOTE_CHECKPOINT')
@@ -229,4 +390,5 @@ class WoTEMiningAgent(HybridAgent):
     def _write_telemetry(self, telemetry):
         if self.nets:
             telemetry.update(self.nets[0].last_diagnostics)
+            self.nets[0].save_debug_frame(telemetry)
         super()._write_telemetry(telemetry)

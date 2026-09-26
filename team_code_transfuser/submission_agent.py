@@ -12,9 +12,13 @@ import numpy as np
 import math
 
 from leaderboard.autoagents import autonomous_agent
-from model import LidarCenterNet
-from config import GlobalConfig
-from data import lidar_to_histogram_features, draw_target_point, lidar_bev_cam_correspondences
+from team_code_transfuser.model import LidarCenterNet
+from team_code_transfuser.config import GlobalConfig
+from team_code_transfuser.data import (
+    lidar_to_histogram_features,
+    draw_target_point,
+    lidar_bev_cam_correspondences,
+)
 
 from shapely.geometry import Polygon
 
@@ -191,8 +195,12 @@ class HybridAgent(autonomous_agent.AutonomousAgent):
             )
             if(self.config.sync_batch_norm == True):
                 net = torch.nn.SyncBatchNorm.convert_sync_batchnorm(net) # Model was trained with Sync. Batch Norm. Need to convert it otherwise parameters will load incorrectly.
+            # Training checkpoints also contain Adam/scaler state.  Loading
+            # the whole file directly onto CUDA wastes several GiB and can
+            # leave too little workspace for cuDNN when CARLA shares an 8 GiB
+            # evaluation GPU.  Load on CPU and move only the network below.
             checkpoint = torch.load(
-                os.path.join(path_to_conf_file, file), map_location=self.device
+                os.path.join(path_to_conf_file, file), map_location='cpu'
             )
             state_dict = self._checkpoint_state_dict(checkpoint)
             # DDP checkpoints have a "module." prefix; single-GPU
@@ -202,9 +210,13 @@ class HybridAgent(autonomous_agent.AutonomousAgent):
             net.load_state_dict(
                 state_dict, strict=self._strict_checkpoint_loading()
             )
+            del state_dict
+            del checkpoint
             net.to(self.device)
             net.eval()
             self.nets.append(net)
+        if self.device.startswith('cuda') and torch.cuda.is_available():
+            torch.cuda.empty_cache()
         if self.model_count == 0:
             raise FileNotFoundError(
                 'no model checkpoint found in %s' % path_to_conf_file

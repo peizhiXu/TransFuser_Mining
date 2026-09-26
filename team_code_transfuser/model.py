@@ -2,12 +2,16 @@ from collections import deque
 import torch.nn.functional as F
 import cv2
 
-from utils import *
-from transfuser import TransfuserBackbone, SegDecoder, DepthDecoder
-from geometric_fusion import GeometricFusionBackbone
-from late_fusion import LateFusionBackbone
-from latentTF import latentTFBackbone
-from lidar_only import LidarOnlyBackbone
+from team_code_transfuser.utils import *
+from team_code_transfuser.transfuser import (
+    TransfuserBackbone,
+    SegDecoder,
+    DepthDecoder,
+)
+from team_code_transfuser.geometric_fusion import GeometricFusionBackbone
+from team_code_transfuser.late_fusion import LateFusionBackbone
+from team_code_transfuser.latentTF import latentTFBackbone
+from team_code_transfuser.lidar_only import LidarOnlyBackbone
 from copy import deepcopy
 
 

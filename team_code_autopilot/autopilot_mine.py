@@ -186,6 +186,10 @@ class MiningExpertMixin(object):
         self._mining_prev_emergency_brake = False
 
         if self.save_path is not None:
+            spawn_seed = int(os.environ.get(
+                "BACKGROUND_SPAWN_SEED",
+                route_index if route_index is not None else 2000,
+            ))
             expert_config = {
                 "version": 1,
                 "vehicle_blueprint": HD465_BLUEPRINT_ID,
@@ -220,6 +224,7 @@ class MiningExpertMixin(object):
                     "traffic_manager_seed": int(os.environ.get(
                         "TRAFFIC_MANAGER_SEED", "0"
                     )),
+                    "spawn_point_seed": spawn_seed,
                 },
             }
             with open(str(self.save_path / "mining_expert_config.json"), "w") as stream:

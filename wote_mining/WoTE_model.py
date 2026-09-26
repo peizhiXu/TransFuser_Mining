@@ -143,6 +143,15 @@ class WoTEMiningWorldModel(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
         self.scene_position = nn.Embedding(BEV_SIDE ** 2 + 1, hidden_dim)
+        # PyTorch 1.12's eval/no-grad TransformerEncoder fast path is not
+        # autocast-safe: FP16 activations can be fused with FP32 weights and
+        # fail during validation. An all-false mask is semantically neutral
+        # and keeps both training and evaluation on the regular AMP-safe path.
+        self.register_buffer(
+            "transition_attention_mask",
+            torch.zeros(BEV_SIDE ** 2 + 1, BEV_SIDE ** 2 + 1, dtype=torch.bool),
+            persistent=False,
+        )
         self.transition = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
                 hidden_dim, heads, hidden_dim * 2, dropout=0.1, batch_first=True
@@ -204,7 +213,9 @@ class WoTEMiningWorldModel(nn.Module):
             tokens = torch.cat((action.unsqueeze(2), scene), dim=2)
             tokens = tokens.reshape(batch * chunk, 65, channels)
             tokens = tokens + self.scene_position.weight.unsqueeze(0)
-            future = self.transition(tokens)
+            future = self.transition(
+                tokens, mask=self.transition_attention_mask
+            )
             future_action = future[:, 0]
             future_scene = inject_trajectory_feature(
                 future[:, 1:], future_action, traj[:, :, -1, :2].reshape(-1, 2),
@@ -638,6 +649,13 @@ class WoTEMiningTrajectoryHead(nn.Module):
         self.anchor_encoder = nn.Sequential(
             nn.Linear(24, 128), nn.ReLU(), nn.Linear(128, hidden_dim)
         )
+        # See the world-model mask above. This also avoids the broken
+        # PyTorch-1.12 eval/no-grad/AMP fused encoder path for 256 anchors.
+        self.register_buffer(
+            "anchor_attention_mask",
+            torch.zeros(anchors.shape[0], anchors.shape[0], dtype=torch.bool),
+            persistent=False,
+        )
         self.anchor_context = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
                 hidden_dim, heads, hidden_dim * 2, dropout=0.1, batch_first=True
@@ -671,8 +689,11 @@ class WoTEMiningTrajectoryHead(nn.Module):
         from being paired with a moving ``anchor + offset`` input.
         """
         batch, count = trajectories.shape[:2]
+        if count != self.anchor_attention_mask.shape[0]:
+            raise ValueError("trajectory count must match the fixed anchor count")
         trajectory_features = self.anchor_context(
-            self.anchor_encoder(trajectories.flatten(2))
+            self.anchor_encoder(trajectories.flatten(2)),
+            mask=self.anchor_attention_mask,
         )
         status = torch.cat((speed.reshape(batch, 1), target_point), dim=1)
         status_feature = self.status_encoder(status).unsqueeze(1).expand(
