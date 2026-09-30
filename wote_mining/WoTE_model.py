@@ -883,23 +883,9 @@ class WoTEMiningPlanner(nn.Module):
             )
             result["current_map_logits"] = self.world_model.map_head(current_map)[:, :4]
             result.update(self.current_agent_head(result["bev_tokens"]))
-        # First counterfactual rollout: each coarse candidate receives its own
-        # predicted T+4 s BEV.  Training detaches this rollout to keep memory
-        # bounded and to prevent the trajectory objective from distorting the
-        # world representation; the same world model remains trained by the
-        # fixed-anchor reward/map branch below.
-        if self.training:
-            with torch.no_grad():
-                coarse_action_features = self.trajectory_head.encode_trajectory_features(
-                    coarse_trajectories, speed, target_point
-                )
-                coarse_world = self.world_model(
-                    result["bev_tokens"], coarse_action_features,
-                    coarse_trajectories,
-                    augmentation_degrees=augmentation_degrees,
-                )
-            coarse_future_bev = coarse_world["future_bev_tokens"].detach()
-        else:
+        if use_refined_world:
+            # Online first rollout: each coarse candidate receives its own
+            # predicted T+4 s BEV and queries it before the final rollout.
             coarse_action_features = self.trajectory_head.encode_trajectory_features(
                 coarse_trajectories, speed, target_point
             )
@@ -909,32 +895,49 @@ class WoTEMiningPlanner(nn.Module):
                 augmentation_degrees=augmentation_degrees,
             )
             coarse_future_bev = coarse_world["future_bev_tokens"]
-        refinement = self.future_trajectory_refiner(
-            result["offset_features"], coarse_future_bev, coarse_trajectories
-        )
-        result["coarse_trajectories"] = coarse_trajectories
-        result.update(refinement)
-        result["trajectories"] = refinement["refined_trajectories"]
-
-        if use_refined_world:
+            refinement = self.future_trajectory_refiner(
+                result["offset_features"], coarse_future_bev, coarse_trajectories
+            )
             # Second rollout during online inference: evaluate consequences of
             # the future-aware trajectories, not the stale coarse futures.
-            world_trajectories = result["refined_trajectories"]
+            world_trajectories = refinement["refined_trajectories"]
             world_action_features = self.trajectory_head.encode_trajectory_features(
                 world_trajectories, speed, target_point
             )
+            world = self.world_model(
+                result["bev_tokens"], world_action_features,
+                world_trajectories, candidate_indices=world_candidate_indices,
+                augmentation_degrees=augmentation_degrees,
+                predict_future_map=(
+                    predict_future_map and future_map_candidate_indices is None
+                ),
+            )
         else:
-            # Training and validation labels are cached for the fixed anchors.
+            # Training/validation labels are cached for all fixed anchors.  A
+            # single differentiable rollout supplies the reward/map branch;
+            # its detached future tokens also guide the new residual head.
+            if world_candidate_indices is not None:
+                raise ValueError(
+                    "fixed-anchor future refinement requires the full candidate set"
+                )
             world_trajectories = result["anchors"]
             world_action_features = result["anchor_features"]
-        world = self.world_model(
-            result["bev_tokens"], world_action_features,
-            world_trajectories, candidate_indices=world_candidate_indices,
-            augmentation_degrees=augmentation_degrees,
-            predict_future_map=(
-                predict_future_map and future_map_candidate_indices is None
-            ),
-        )
+            world = self.world_model(
+                result["bev_tokens"], world_action_features,
+                world_trajectories,
+                augmentation_degrees=augmentation_degrees,
+                predict_future_map=(
+                    predict_future_map and future_map_candidate_indices is None
+                ),
+            )
+            refinement = self.future_trajectory_refiner(
+                result["offset_features"],
+                world["future_bev_tokens"].detach(), coarse_trajectories,
+            )
+
+        result["coarse_trajectories"] = coarse_trajectories
+        result.update(refinement)
+        result["trajectories"] = refinement["refined_trajectories"]
         result.update(world)
         if predict_future_map and future_map_candidate_indices is not None:
             result.update(self.world_model.decode_future_map(

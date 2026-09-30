@@ -50,11 +50,12 @@ CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run \
 64个未来BEV token。融合采用拼接MLP和残差连接，最后的24维轨迹修正层为零初始化，
 因此未训练时的新轨迹与原WoTE轨迹严格相同。
 
-训练时第一次推演只提供停止梯度的未来特征，新增
-`loss_future_refinement` 在oracle匹配的anchor上监督修正轨迹。原有五项reward缓存和
-未来语义图标签仍只监督固定anchor分支，避免把固定候选标签错误地配给移动后的
-轨迹。在线推理时完整执行两次共享权重的世界模型：第一次指导修正，第二次预测
-修正轨迹对应的T+4秒未来；两次不是连续预测到T+8秒。修正损失权重可通过
+训练时只运行一次固定anchor世界模型：同一组未来token以停止梯度的方式指导轨迹
+残差，同时正常参与原有五项reward和未来语义图监督。新增
+`loss_future_refinement` 在oracle匹配的anchor上监督修正轨迹，因此不会把固定候选
+reward标签错误地配给移动后的轨迹。在线推理时完整执行两次共享权重的世界模型：
+第一次指导修正，第二次预测修正轨迹对应的T+4秒未来；两次不是连续预测到T+8秒。
+修正损失权重可通过
 `--future-refinement-loss-weight` 设置，默认值为1.0。
 
 `latest.pth` 每个 epoch 覆盖保存，`best.pth` 保存最低验证总损失，编号 checkpoint
