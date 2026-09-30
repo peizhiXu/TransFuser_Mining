@@ -48,6 +48,14 @@ class WoTEMiningTrainingModule(nn.Module):
         offsets = torch.arange(sampled, device=future_poses.device)[None]
         return (nearest + offsets) % count
 
+    def _matched_anchor_indices(self, future_poses):
+        """Return the fixed anchor nearest to each recorded expert future."""
+        anchors = self.planner.trajectory_head.anchors.to(future_poses)
+        distance = torch.linalg.vector_norm(
+            (anchors[None] - future_poses[:, None]).flatten(2), dim=-1
+        )
+        return distance.argmin(dim=1)
+
     def forward(self, batch):
         rgb = batch["rgb"].float()
         lidar = batch["lidar"].float()
@@ -57,11 +65,13 @@ class WoTEMiningTrainingModule(nn.Module):
         target_point = batch["target_point"].float()
         future_poses = batch["wote_future_poses"].float()
         future_map_indices = self._future_map_indices(future_poses)
+        refinement_candidate_indices = self._matched_anchor_indices(future_poses)
         return self.planner(
             rgb, lidar, speed, target_point,
             augmentation_degrees=batch["wote_augmentation_degrees"].float(),
             predict_future_map=True,
             future_map_candidate_indices=future_map_indices,
+            refinement_candidate_indices=refinement_candidate_indices,
             # Cached reward/map targets were generated for the fixed 256
             # anchors.  The future-aware trajectories receive their separate
             # residual imitation loss, but only online CARLA inference sends
@@ -188,8 +198,14 @@ class WoTEMiningTrainingModule(nn.Module):
             diagnostics[prefix + "_fde_m"] = displacement[:, -1].mean()
             diagnostic_weights[prefix + "_ade_m"] = future.new_tensor(batch_size)
             diagnostic_weights[prefix + "_fde_m"] = future.new_tensor(batch_size)
+        # Training refines only the oracle-matched coarse candidate. Measure
+        # that candidate rather than averaging its correction with 255
+        # deliberately zero, unsupervised slots.
+        matched_refinement = outputs["future_refinement_offsets"][
+            batch_index, nearest
+        ]
         refinement_xy = torch.linalg.vector_norm(
-            outputs["future_refinement_offsets"][..., :2], dim=-1
+            matched_refinement[..., :2], dim=-1
         )
         diagnostics["traj_refinement_mean_m"] = refinement_xy.mean()
         diagnostics["traj_refinement_max_m"] = refinement_xy.amax()

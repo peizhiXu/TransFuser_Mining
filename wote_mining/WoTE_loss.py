@@ -13,9 +13,10 @@ from torch.nn import functional as F
 def future_refinement_loss(outputs, future_poses):
     """Supervise the future-aware refinement on the oracle anchor mode.
 
-    Cached metric targets remain attached to fixed anchors.  This loss is the
-    only objective that directly supervises the moved, future-aware trajectory
-    and therefore avoids pairing it with stale counterfactual reward labels.
+    Cached metric targets remain attached to fixed anchors. During training,
+    the oracle-matched coarse trajectory is appended to the fixed-anchor world
+    rollout, so its detached future BEV exactly matches the trajectory being
+    refined. This loss never pairs a moved trajectory with stale reward labels.
     """
     anchors = outputs["anchors"]
     coarse = outputs["coarse_trajectories"]

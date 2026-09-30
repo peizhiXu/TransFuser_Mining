@@ -869,7 +869,8 @@ class WoTEMiningPlanner(nn.Module):
     def forward(self, rgb, lidar_bev, speed, target_point,
                 world_candidate_indices=None, augmentation_degrees=None,
                 predict_future_map=False, future_map_candidate_indices=None,
-                predict_auxiliary=True, use_refined_world=True):
+                predict_auxiliary=True, use_refined_world=True,
+                refinement_candidate_indices=None):
         # WoTE asks the local backbone for its fused 512x8x8 LiDAR map before
         # the legacy TransFuser output heads.
         fused_lidar = self.backbone(
@@ -886,9 +887,11 @@ class WoTEMiningPlanner(nn.Module):
         if use_refined_world:
             # Online first rollout: each coarse candidate receives its own
             # predicted T+4 s BEV and queries it before the final rollout.
-            coarse_action_features = self.trajectory_head.encode_trajectory_features(
-                coarse_trajectories, speed, target_point
-            )
+            # Keep the fixed candidate identity feature used to train the
+            # world model, while the action encoder separately receives the
+            # actual coarse trajectory coordinates. The aligned training path
+            # below uses exactly the same feature/trajectory pairing.
+            coarse_action_features = result["anchor_features"]
             coarse_world = self.world_model(
                 result["bev_tokens"], coarse_action_features,
                 coarse_trajectories,
@@ -914,26 +917,86 @@ class WoTEMiningPlanner(nn.Module):
             )
         else:
             # Training/validation labels are cached for all fixed anchors.  A
-            # single differentiable rollout supplies the reward/map branch;
-            # its detached future tokens also guide the new residual head.
+            # single differentiable rollout supplies the reward/map branch.
+            # Append the oracle-matched *coarse* trajectory to that same call
+            # so the refiner sees the future caused by exactly the trajectory
+            # it is asked to change, while cached labels remain paired only
+            # with the first 256 fixed anchors.
             if world_candidate_indices is not None:
                 raise ValueError(
                     "fixed-anchor future refinement requires the full candidate set"
                 )
-            world_trajectories = result["anchors"]
-            world_action_features = result["anchor_features"]
-            world = self.world_model(
-                result["bev_tokens"], world_action_features,
-                world_trajectories,
+            batch, candidate_count = coarse_trajectories.shape[:2]
+            if (refinement_candidate_indices is None
+                    or refinement_candidate_indices.shape != (batch,)
+                    or refinement_candidate_indices.dtype != torch.long):
+                raise ValueError(
+                    "training refinement_candidate_indices must have shape [B] "
+                    "and dtype int64"
+                )
+            if ((refinement_candidate_indices < 0).any()
+                    or (refinement_candidate_indices >= candidate_count).any()):
+                raise ValueError("refinement candidate index is out of range")
+            batch_index = torch.arange(batch, device=coarse_trajectories.device)
+            matched_coarse = coarse_trajectories[
+                batch_index, refinement_candidate_indices
+            ][:, None]
+            matched_query_features = result["offset_features"][
+                batch_index, refinement_candidate_indices
+            ][:, None]
+            matched_world_features = result["anchor_features"][
+                batch_index, refinement_candidate_indices
+            ][:, None]
+            mixed_trajectories = torch.cat(
+                (result["anchors"], matched_coarse), dim=1
+            )
+            mixed_action_features = torch.cat(
+                (result["anchor_features"], matched_world_features), dim=1
+            )
+            mixed_world = self.world_model(
+                result["bev_tokens"], mixed_action_features,
+                mixed_trajectories,
                 augmentation_degrees=augmentation_degrees,
                 predict_future_map=(
                     predict_future_map and future_map_candidate_indices is None
                 ),
             )
-            refinement = self.future_trajectory_refiner(
-                result["offset_features"],
-                world["future_bev_tokens"].detach(), coarse_trajectories,
+            world_trajectories = result["anchors"]
+            world_action_features = result["anchor_features"]
+            world = {
+                "future_bev_tokens": mixed_world["future_bev_tokens"][
+                    :, :candidate_count
+                ],
+                "future_action_features": mixed_world["future_action_features"][
+                    :, :candidate_count
+                ],
+                "world_trajectories": mixed_world["world_trajectories"][
+                    :, :candidate_count
+                ],
+            }
+            matched_refinement = self.future_trajectory_refiner(
+                matched_query_features,
+                mixed_world["future_bev_tokens"][:, candidate_count:].detach(),
+                matched_coarse,
             )
+            trajectory_index = refinement_candidate_indices[:, None, None, None]
+            trajectory_index = trajectory_index.expand(-1, 1, 8, 3)
+            refinement_offsets = torch.zeros_like(coarse_trajectories).scatter(
+                1, trajectory_index,
+                matched_refinement["future_refinement_offsets"],
+            )
+            feature_index = refinement_candidate_indices[:, None, None].expand(
+                -1, 1, result["offset_features"].shape[-1]
+            )
+            refinement_features = result["offset_features"].scatter(
+                1, feature_index,
+                matched_refinement["future_refinement_features"],
+            )
+            refinement = {
+                "future_refinement_features": refinement_features,
+                "future_refinement_offsets": refinement_offsets,
+                "refined_trajectories": coarse_trajectories + refinement_offsets,
+            }
 
         result["coarse_trajectories"] = coarse_trajectories
         result.update(refinement)
