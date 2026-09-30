@@ -276,6 +276,12 @@ class WoTEMiningInferenceModel(nn.Module):
         selected_local = outputs["selected_index"]
         selected_metrics = outputs["metric_scores"][batch_index, selected_local]
         selected_rewards = outputs["final_rewards"][batch_index, selected_local]
+        selected_refinement = outputs["future_refinement_offsets"][
+            batch_index, selected_local
+        ]
+        selected_refinement_xy = torch.linalg.vector_norm(
+            selected_refinement[..., :2], dim=-1
+        )
         self.last_diagnostics = {
             "selected_anchor_index": int(
                 outputs["selected_anchor_index"][0].detach().cpu()
@@ -284,6 +290,12 @@ class WoTEMiningInferenceModel(nn.Module):
             "selected_metric_scores": [
                 float(value) for value in selected_metrics[0].detach().cpu()
             ],
+            "selected_refinement_mean_m": float(
+                selected_refinement_xy[0].mean().detach().cpu()
+            ),
+            "selected_refinement_max_m": float(
+                selected_refinement_xy[0].max().detach().cpu()
+            ),
         }
         self.debug_step += 1
         if (kwargs.get("debug", False) and kwargs.get("save_path") is not None

@@ -27,6 +27,7 @@ class WoTEMiningConfig(GlobalConfig):
     # Source WoTE training defaults (configs/default.py).
     wote_num_future_map_candidates = 1
     wote_traj_offset_loss_weight = 1.0
+    wote_future_refinement_loss_weight = 1.0
     wote_offset_imitation_loss_weight = 0.1
     wote_imitation_reward_loss_weight = 1.0
     wote_metric_reward_loss_weight = 1.0

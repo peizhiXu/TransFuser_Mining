@@ -36,6 +36,27 @@ CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run \
 都使用固定 anchor；轨迹 offset 分支仍正常学习。CARLA 在线推理时才将修正后的
 轨迹送入世界模型评价，这与原版 WoTE 的训练/推理设计一致。
 
+## Future-BEV 轨迹修正分支
+
+`future-bev-planning` 分支在 WoTE 候选生成和最终评价之间增加一次候选级未来反馈：
+
+```text
+当前BEV → 256条粗轨迹 → 第一次世界模型 → 每条候选自己的未来BEV
+       → 候选/未来交叉注意力 → 8点轨迹残差 → 第二次世界模型
+       → 原WoTE reward评价一次 → 最终轨迹
+```
+
+候选特征已经通过原轨迹解码器读取过当前BEV；新增模块只让每条候选查询自己的
+64个未来BEV token。融合采用拼接MLP和残差连接，最后的24维轨迹修正层为零初始化，
+因此未训练时的新轨迹与原WoTE轨迹严格相同。
+
+训练时第一次推演只提供停止梯度的未来特征，新增
+`loss_future_refinement` 在oracle匹配的anchor上监督修正轨迹。原有五项reward缓存和
+未来语义图标签仍只监督固定anchor分支，避免把固定候选标签错误地配给移动后的
+轨迹。在线推理时完整执行两次共享权重的世界模型：第一次指导修正，第二次预测
+修正轨迹对应的T+4秒未来；两次不是连续预测到T+8秒。修正损失权重可通过
+`--future-refinement-loss-weight` 设置，默认值为1.0。
+
 `latest.pth` 每个 epoch 覆盖保存，`best.pth` 保存最低验证总损失，编号 checkpoint
 默认每5个 epoch及最后一个 epoch保存；可通过 `--save-every` 调整。
 
@@ -62,5 +83,7 @@ sigmoid 形式用于兼容矿山版可相互重叠的语义图层。
 
 `metrics.jsonl` 除联合 loss 外，还记录五个评价头各自的 `bce`、`mae`、
 `pred_mean`、`target_mean` 和 `valid_fraction`，以及轨迹的
-`traj_matched_{ade,fde}_m` 与 `traj_selected_{ade,fde}_m`。这些字段均为
+`traj_coarse_matched_{ade,fde}_m`、`traj_matched_{ade,fde}_m`、
+`traj_selected_{ade,fde}_m`、`traj_refinement_mean_m` 和
+`traj_refinement_max_m`。这些字段均为
 无梯度监控量，不参与 `loss_total`，不会改变训练目标。

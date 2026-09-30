@@ -16,7 +16,7 @@ if str(ROOT) not in sys.path:
 import torch
 from torch import nn
 
-from wote_mining.WoTE_loss import source_style_core_losses
+from wote_mining.WoTE_loss import future_refinement_loss, source_style_core_losses
 from wote_mining.WoTE_model import METRIC_NAMES, current_semantic_map_loss
 
 
@@ -62,9 +62,10 @@ class WoTEMiningTrainingModule(nn.Module):
             augmentation_degrees=batch["wote_augmentation_degrees"].float(),
             predict_future_map=True,
             future_map_candidate_indices=future_map_indices,
-            # Both train and validation targets were generated for the fixed
-            # 256 anchors.  Refined trajectories are used only by the online
-            # CARLA agent, matching the source WoTE train/eval split.
+            # Cached reward/map targets were generated for the fixed 256
+            # anchors.  The future-aware trajectories receive their separate
+            # residual imitation loss, but only online CARLA inference sends
+            # them through the final reward-world rollout.
             use_refined_world=False,
         )
 
@@ -77,6 +78,9 @@ class WoTEMiningTrainingModule(nn.Module):
         )
         core.pop("matched_anchor")
         raw = dict(core)
+        raw["loss_future_refinement"] = future_refinement_loss(
+            outputs, batch["wote_future_poses"].float()
+        )
         raw["loss_current_map"] = current_semantic_map_loss(
             outputs["current_map_logits"],
             batch["wote_current_scene"].float(),
@@ -95,6 +99,7 @@ class WoTEMiningTrainingModule(nn.Module):
         )
         weights = {
             "loss_traj_offset": self.config.wote_traj_offset_loss_weight,
+            "loss_future_refinement": self.config.wote_future_refinement_loss_weight,
             "loss_offset_imitation": self.config.wote_offset_imitation_loss_weight,
             "loss_imitation_reward": self.config.wote_imitation_reward_loss_weight,
             "loss_metric_reward": self.config.wote_metric_reward_loss_weight,
@@ -162,6 +167,9 @@ class WoTEMiningTrainingModule(nn.Module):
         ).argmin(dim=1)
         batch_index = torch.arange(batch_size, device=anchors.device)
         matched_trajectory = outputs["trajectories"][batch_index, nearest]
+        coarse_matched_trajectory = outputs["coarse_trajectories"][
+            batch_index, nearest
+        ]
 
         # During training the reward labels correspond to fixed anchors. Use
         # the selected anchor ID to inspect the refined trajectory that would
@@ -169,6 +177,7 @@ class WoTEMiningTrainingModule(nn.Module):
         selected_index = outputs["selected_index"]
         selected_trajectory = outputs["trajectories"][batch_index, selected_index]
         for prefix, trajectory in (
+            ("traj_coarse_matched", coarse_matched_trajectory),
             ("traj_matched", matched_trajectory),
             ("traj_selected", selected_trajectory),
         ):
@@ -179,6 +188,15 @@ class WoTEMiningTrainingModule(nn.Module):
             diagnostics[prefix + "_fde_m"] = displacement[:, -1].mean()
             diagnostic_weights[prefix + "_ade_m"] = future.new_tensor(batch_size)
             diagnostic_weights[prefix + "_fde_m"] = future.new_tensor(batch_size)
+        refinement_xy = torch.linalg.vector_norm(
+            outputs["future_refinement_offsets"][..., :2], dim=-1
+        )
+        diagnostics["traj_refinement_mean_m"] = refinement_xy.mean()
+        diagnostics["traj_refinement_max_m"] = refinement_xy.amax()
+        diagnostic_weights["traj_refinement_mean_m"] = future.new_tensor(
+            refinement_xy.numel()
+        )
+        diagnostic_weights["traj_refinement_max_m"] = future.new_tensor(batch_size)
         return diagnostics, diagnostic_weights
 
 
@@ -284,6 +302,10 @@ def parse_args():
     parser.add_argument("--use-velocity", action="store_true")
     parser.add_argument("--no-target-point-image", action="store_true")
     parser.add_argument("--future-map-candidates", type=int, default=1)
+    parser.add_argument(
+        "--future-refinement-loss-weight", type=float, default=1.0,
+        help="weight of the oracle-matched future-aware trajectory loss",
+    )
     parser.add_argument("--grad-clip", type=float, default=5.0)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--resume", default=None)
@@ -556,6 +578,9 @@ def main():
     config.use_target_point_image = not args.no_target_point_image
     config.n_layer = args.transformer_layers
     config.wote_num_future_map_candidates = args.future_map_candidates
+    if args.future_refinement_loss_weight < 0:
+        raise ValueError("future refinement loss weight must be nonnegative")
+    config.wote_future_refinement_loss_weight = args.future_refinement_loss_weight
     config.wote_lr = args.lr
     config.wote_min_lr = args.min_lr
     config.wote_weight_decay = args.weight_decay

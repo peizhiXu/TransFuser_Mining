@@ -10,6 +10,38 @@ import torch
 from torch.nn import functional as F
 
 
+def future_refinement_loss(outputs, future_poses):
+    """Supervise the future-aware refinement on the oracle anchor mode.
+
+    Cached metric targets remain attached to fixed anchors.  This loss is the
+    only objective that directly supervises the moved, future-aware trajectory
+    and therefore avoids pairing it with stale counterfactual reward labels.
+    """
+    anchors = outputs["anchors"]
+    coarse = outputs["coarse_trajectories"]
+    predicted_residual = outputs["future_refinement_offsets"]
+    if anchors.ndim != 4 or anchors.shape[2:] != (8, 3):
+        raise ValueError("anchors must have shape [B,K,8,3]")
+    batch, count = anchors.shape[:2]
+    if (coarse.shape != anchors.shape or predicted_residual.shape != anchors.shape
+            or future_poses.shape != (batch, 8, 3)):
+        raise ValueError("refined trajectories/future poses have incompatible shapes")
+    distance = torch.linalg.vector_norm(
+        (anchors - future_poses[:, None]).reshape(batch, count, -1), dim=-1
+    )
+    winner = distance.argmin(dim=1)
+    batch_index = torch.arange(batch, device=anchors.device)
+    # The coarse branch already has its own source-style offset loss.  Train
+    # this head on only the remaining residual so the new objective does not
+    # duplicate the gradient into the coarse trajectory coordinates.
+    desired_residual = (
+        future_poses - coarse[batch_index, winner].detach()
+    )
+    return F.smooth_l1_loss(
+        predicted_residual[batch_index, winner], desired_residual
+    )
+
+
 def source_style_core_losses(outputs, future_poses, metric_targets=None,
                              metric_valid=None):
     """WTA offset + soft imitation objectives, optionally five metric heads.

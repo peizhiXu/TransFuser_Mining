@@ -755,6 +755,84 @@ class WoTEMiningTrajectoryHead(nn.Module):
         }
 
 
+class WoTEFutureTrajectoryRefiner(nn.Module):
+    """Use each candidate's own predicted future BEV to refine its poses.
+
+    The incoming candidate features have already attended to the current BEV
+    in :class:`WoTEMiningTrajectoryHead`.  This module therefore only adds the
+    missing counterfactual interaction: candidate ``i`` queries the future BEV
+    predicted under trajectory ``i``.  Candidates are processed in chunks to
+    avoid materializing attention activations for all 256 modes at once.
+    """
+
+    def __init__(self, hidden_dim=256, heads=8, candidate_chunk=16):
+        super().__init__()
+        if candidate_chunk < 1:
+            raise ValueError("candidate_chunk must be positive")
+        self.hidden_dim = int(hidden_dim)
+        self.candidate_chunk = int(candidate_chunk)
+        self.query_norm = nn.LayerNorm(hidden_dim)
+        self.future_norm = nn.LayerNorm(hidden_dim)
+        self.future_attention = nn.MultiheadAttention(
+            hidden_dim, heads, dropout=0.1, batch_first=True
+        )
+        self.fusion = nn.Sequential(
+            nn.Linear(2 * hidden_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.output_norm = nn.LayerNorm(hidden_dim)
+        self.refinement_head = nn.Linear(hidden_dim, 24)
+        # Before learning, the refined trajectory is exactly equal to the
+        # existing WoTE trajectory even though the future-aware path is active.
+        nn.init.zeros_(self.refinement_head.weight)
+        nn.init.zeros_(self.refinement_head.bias)
+
+    def forward(self, candidate_features, future_bev_tokens, trajectories):
+        if candidate_features.ndim != 3:
+            raise ValueError("candidate_features must have shape [B,K,C]")
+        batch, count, channels = candidate_features.shape
+        if channels != self.hidden_dim:
+            raise ValueError("candidate feature width does not match hidden_dim")
+        if future_bev_tokens.shape != (batch, count, 64, channels):
+            raise ValueError("future_bev_tokens must have shape [B,K,64,C]")
+        if trajectories.shape != (batch, count, 8, 3):
+            raise ValueError("trajectories must have shape [B,K,8,3]")
+
+        refined_feature_chunks = []
+        for start in range(0, count, self.candidate_chunk):
+            stop = min(start + self.candidate_chunk, count)
+            chunk = stop - start
+            query = self.query_norm(
+                candidate_features[:, start:stop]
+            ).reshape(batch * chunk, 1, channels)
+            memory = self.future_norm(
+                future_bev_tokens[:, start:stop]
+            ).reshape(batch * chunk, 64, channels)
+            future_feature, _ = self.future_attention(
+                query, memory, memory, need_weights=False
+            )
+            current_feature = candidate_features[:, start:stop].reshape(
+                batch * chunk, channels
+            )
+            future_feature = future_feature[:, 0]
+            fused = current_feature + self.fusion(
+                torch.cat((current_feature, future_feature), dim=-1)
+            )
+            refined_feature_chunks.append(
+                self.output_norm(fused).reshape(batch, chunk, channels)
+            )
+
+        refined_features = torch.cat(refined_feature_chunks, dim=1)
+        refinement_offsets = self.refinement_head(refined_features).reshape(
+            batch, count, 8, 3
+        )
+        return {
+            "future_refinement_features": refined_features,
+            "future_refinement_offsets": refinement_offsets,
+            "refined_trajectories": trajectories + refinement_offsets,
+        }
+
+
 class WoTEMiningPlanner(nn.Module):
     """Connect the unchanged mining TransFuser fusion backbone to WoTE queries."""
 
@@ -778,6 +856,9 @@ class WoTEMiningPlanner(nn.Module):
         self.world_model = WoTEMiningWorldModel(
             lidar_x=backbone.config.lidar_pos[0]
         )
+        self.future_trajectory_refiner = WoTEFutureTrajectoryRefiner(
+            candidate_chunk=self.world_model.candidate_chunk
+        )
         self.reward_head = WoTEMiningRewardHead(
             weights=getattr(backbone.config, "wote_reward_weights", (0.1, 0.5, 0.5, 1.0))
         )
@@ -795,14 +876,50 @@ class WoTEMiningPlanner(nn.Module):
             rgb, lidar_bev, speed, return_fused_lidar=True
         )
         result = self.trajectory_head(fused_lidar, speed, target_point)
+        coarse_trajectories = result["trajectories"]
         if predict_auxiliary:
             current_map = result["bev_tokens"].transpose(1, 2).reshape(
                 result["bev_tokens"].shape[0], 256, 8, 8
             )
             result["current_map_logits"] = self.world_model.map_head(current_map)[:, :4]
             result.update(self.current_agent_head(result["bev_tokens"]))
+        # First counterfactual rollout: each coarse candidate receives its own
+        # predicted T+4 s BEV.  Training detaches this rollout to keep memory
+        # bounded and to prevent the trajectory objective from distorting the
+        # world representation; the same world model remains trained by the
+        # fixed-anchor reward/map branch below.
+        if self.training:
+            with torch.no_grad():
+                coarse_action_features = self.trajectory_head.encode_trajectory_features(
+                    coarse_trajectories, speed, target_point
+                )
+                coarse_world = self.world_model(
+                    result["bev_tokens"], coarse_action_features,
+                    coarse_trajectories,
+                    augmentation_degrees=augmentation_degrees,
+                )
+            coarse_future_bev = coarse_world["future_bev_tokens"].detach()
+        else:
+            coarse_action_features = self.trajectory_head.encode_trajectory_features(
+                coarse_trajectories, speed, target_point
+            )
+            coarse_world = self.world_model(
+                result["bev_tokens"], coarse_action_features,
+                coarse_trajectories,
+                augmentation_degrees=augmentation_degrees,
+            )
+            coarse_future_bev = coarse_world["future_bev_tokens"]
+        refinement = self.future_trajectory_refiner(
+            result["offset_features"], coarse_future_bev, coarse_trajectories
+        )
+        result["coarse_trajectories"] = coarse_trajectories
+        result.update(refinement)
+        result["trajectories"] = refinement["refined_trajectories"]
+
         if use_refined_world:
-            world_trajectories = result["trajectories"]
+            # Second rollout during online inference: evaluate consequences of
+            # the future-aware trajectories, not the stale coarse futures.
+            world_trajectories = result["refined_trajectories"]
             world_action_features = self.trajectory_head.encode_trajectory_features(
                 world_trajectories, speed, target_point
             )
