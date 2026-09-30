@@ -981,16 +981,22 @@ class WoTEMiningPlanner(nn.Module):
             )
             trajectory_index = refinement_candidate_indices[:, None, None, None]
             trajectory_index = trajectory_index.expand(-1, 1, 8, 3)
+            matched_offsets = matched_refinement[
+                "future_refinement_offsets"
+            ].to(dtype=coarse_trajectories.dtype)
             refinement_offsets = torch.zeros_like(coarse_trajectories).scatter(
                 1, trajectory_index,
-                matched_refinement["future_refinement_offsets"],
+                matched_offsets,
             )
             feature_index = refinement_candidate_indices[:, None, None].expand(
                 -1, 1, result["offset_features"].shape[-1]
             )
+            matched_refinement_features = matched_refinement[
+                "future_refinement_features"
+            ].to(dtype=result["offset_features"].dtype)
             refinement_features = result["offset_features"].scatter(
                 1, feature_index,
-                matched_refinement["future_refinement_features"],
+                matched_refinement_features,
             )
             refinement = {
                 "future_refinement_features": refinement_features,
