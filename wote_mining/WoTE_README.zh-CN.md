@@ -41,13 +41,15 @@ CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run \
 `future-bev-planning` 分支在 WoTE 候选生成和最终评价之间增加一次候选级未来反馈：
 
 ```text
-当前BEV → 256条粗轨迹 → 第一次世界模型 → 每条候选自己的未来BEV
-       → 候选/未来交叉注意力 → 8点轨迹残差 → 第二次世界模型
-       → 原WoTE reward评价一次 → 最终轨迹
+当前BEV → 256条粗轨迹 → 第一次世界模型 → 粗轨迹reward预评分
+       → top-4候选/未来交叉注意力 → 8点轨迹残差
+       → 与其余252条未修正轨迹合并 → 第二次世界模型
+       → 原WoTE reward最终评分 → 最终轨迹
 ```
 
-候选特征已经通过原轨迹解码器读取过当前BEV。修正器还直接编码粗轨迹的
-8个 (x,y,yaw) 点，让候选查询自己的64个未来BEV token。融合后为每个轨迹点预测
+候选特征已经通过原轨迹解码器读取过当前BEV。在线阶段先对256条粗轨迹预评分，
+只让reward最高的4条查询各自的64个未来BEV token；其余252条保留粗轨迹并继续参加
+最终评分。修正器还直接编码候选的8个 (x,y,yaw) 点，融合后为每个轨迹点预测
 残差及0--1门控；横纵向单点修正限制在2 m内，航向角修正限制在0.35 rad内。
 残差层零初始化，因此未训练时的新轨迹与原WoTE轨迹严格相同。
 
@@ -61,8 +63,9 @@ CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run \
 修正损失不再通过候选隐藏特征反传到原轨迹解码器；原 WoTE 损失继续训练粗轨迹。
 缓存的 reward 和未来地图标签始终只与固定 anchor 对齐。
 
-在线推理流程不变：第一次用未来 BEV 指导 256 条粗轨迹修正，第二次预测修正轨迹对应的
-T+4 秒未来并由原 WoTE reward 选择最终轨迹；两次不是连续预测到 T+8 秒。修正损失权重
+在线推理使用两次共享权重的世界模型和两次 reward head：第一次 reward 只确定需要
+修正的 top-4 粗轨迹，第二次 reward 对4条修正轨迹与252条原粗轨迹统一评分并选择最终轨迹。
+两次世界模型都是从当前时刻预测 T+4 秒，不是连续预测到 T+8 秒。修正损失权重
 由 `--future-refinement-loss-weight` 设置；接近专家时的少改约束由
 `--refinement-identity-loss-weight` 设置，默认0.1。附加候选数和兼容门槛可分别通过
 `--refinement-reward-topk`、`--refinement-endpoint-max-m` 和

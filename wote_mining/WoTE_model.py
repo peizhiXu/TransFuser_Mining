@@ -946,6 +946,11 @@ class WoTEMiningPlanner(nn.Module):
         self.reward_head = WoTEMiningRewardHead(
             weights=getattr(backbone.config, "wote_reward_weights", (0.1, 0.5, 0.5, 1.0))
         )
+        self.refinement_inference_topk = int(getattr(
+            backbone.config, "wote_refinement_inference_topk", 4
+        ))
+        if self.refinement_inference_topk < 1:
+            raise ValueError("wote_refinement_inference_topk must be positive")
         self.current_agent_head = WoTEMiningAgentHead(
             lidar_x=backbone.config.lidar_pos[0]
         )
@@ -984,11 +989,57 @@ class WoTEMiningPlanner(nn.Module):
                 augmentation_degrees=augmentation_degrees,
             )
             coarse_future_bev = coarse_world["future_bev_tokens"]
-            refinement = self.future_trajectory_refiner(
-                result["offset_features"], coarse_future_bev, coarse_trajectories
+            coarse_rewards = self.reward_head(
+                result["bev_tokens"], coarse_future_bev,
+                coarse_action_features, coarse_world["future_action_features"],
             )
-            # Second rollout during online inference: evaluate consequences of
-            # the future-aware trajectories, not the stale coarse futures.
+            batch, candidate_count = coarse_trajectories.shape[:2]
+            refinement_count = min(
+                self.refinement_inference_topk, candidate_count
+            )
+            refinement_indices = coarse_rewards["final_rewards"].detach().topk(
+                refinement_count, dim=1
+            ).indices
+            trajectory_index = refinement_indices[:, :, None, None].expand(
+                -1, -1, 8, 3
+            )
+            feature_index = refinement_indices[:, :, None].expand(
+                -1, -1, result["offset_features"].shape[-1]
+            )
+            bev_index = refinement_indices[:, :, None, None].expand(
+                -1, -1, coarse_future_bev.shape[2], coarse_future_bev.shape[3]
+            )
+            selected_coarse = coarse_trajectories.gather(1, trajectory_index)
+            selected_refinement = self.future_trajectory_refiner(
+                result["offset_features"].gather(1, feature_index),
+                coarse_future_bev.gather(1, bev_index),
+                selected_coarse,
+            )
+            selected_offsets = selected_refinement[
+                "future_refinement_offsets"
+            ].to(coarse_trajectories)
+            refinement_offsets = torch.zeros_like(coarse_trajectories).scatter(
+                1, trajectory_index, selected_offsets
+            )
+            gate_index = refinement_indices[:, :, None, None].expand(
+                -1, -1, 8, 1
+            )
+            selected_gate = selected_refinement["future_refinement_gate"].to(
+                coarse_trajectories
+            )
+            refinement_gate = torch.zeros_like(
+                coarse_trajectories[..., :1]
+            ).scatter(1, gate_index, selected_gate)
+            refinement = {
+                "future_refinement_features": result["offset_features"],
+                "future_refinement_gate": refinement_gate,
+                "future_refinement_offsets": refinement_offsets,
+                "refined_trajectories": coarse_trajectories + refinement_offsets,
+            }
+            result["coarse_final_rewards"] = coarse_rewards["final_rewards"]
+            result["refinement_inference_indices"] = refinement_indices
+            # The final rollout still evaluates all 256 trajectories. Modes
+            # outside the pre-score top-k remain unchanged coarse trajectories.
             world_trajectories = refinement["refined_trajectories"]
             world_action_features = self.trajectory_head.encode_trajectory_features(
                 world_trajectories, speed, target_point

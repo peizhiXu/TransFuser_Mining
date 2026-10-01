@@ -32,6 +32,8 @@ class WoTEMiningConfig(GlobalConfig):
     # Refine the oracle mode plus reward-preferred coarse candidates which
     # remain close enough to the recorded expert to share its supervision.
     wote_refinement_reward_topk = 4
+    # Online refinement is limited to the coarse modes most likely to execute.
+    wote_refinement_inference_topk = 4
     wote_refinement_endpoint_max_m = 2.0
     wote_refinement_ade_max_m = 1.0
     wote_offset_imitation_loss_weight = 0.1

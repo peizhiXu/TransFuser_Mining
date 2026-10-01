@@ -211,7 +211,13 @@ class WoTEMiningInferenceModel(nn.Module):
         lines = [
             "WoTE HD465 closed-loop",
             "frame: %d" % data["frame"],
-            "anchor: %s" % diagnostics.get("selected_anchor_index", "n/a"),
+            "anchor: %s   refined: %s" % (
+                diagnostics.get("selected_anchor_index", "n/a"),
+                diagnostics.get("selected_was_refined", "n/a"),
+            ),
+            "coarse top: %s" % diagnostics.get(
+                "coarse_selected_anchor_index", "n/a"
+            ),
             "reward: %.5f" % diagnostics.get("selected_reward", float("nan")),
             "speed: %.2f m/s   desired: %.2f m/s" % (
                 data["speed"], telemetry.get("desired_speed", float("nan"))
@@ -276,6 +282,11 @@ class WoTEMiningInferenceModel(nn.Module):
         selected_local = outputs["selected_index"]
         selected_metrics = outputs["metric_scores"][batch_index, selected_local]
         selected_rewards = outputs["final_rewards"][batch_index, selected_local]
+        refinement_indices = outputs["refinement_inference_indices"]
+        selected_was_refined = (
+            refinement_indices == selected_local[:, None]
+        ).any(dim=1)
+        coarse_selected = outputs["coarse_final_rewards"].argmax(dim=1)
         selected_refinement = outputs["future_refinement_offsets"][
             batch_index, selected_local
         ]
@@ -287,6 +298,15 @@ class WoTEMiningInferenceModel(nn.Module):
                 outputs["selected_anchor_index"][0].detach().cpu()
             ),
             "selected_reward": float(selected_rewards[0].detach().cpu()),
+            "selected_was_refined": bool(
+                selected_was_refined[0].detach().cpu()
+            ),
+            "coarse_selected_anchor_index": int(
+                coarse_selected[0].detach().cpu()
+            ),
+            "refinement_anchor_indices": [
+                int(value) for value in refinement_indices[0].detach().cpu()
+            ],
             "selected_metric_scores": [
                 float(value) for value in selected_metrics[0].detach().cpu()
             ],
