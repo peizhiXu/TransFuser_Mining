@@ -50,16 +50,19 @@ CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run \
 64个未来BEV token。融合采用拼接MLP和残差连接，最后的24维轨迹修正层为零初始化，
 因此未训练时的新轨迹与原WoTE轨迹严格相同。
 
-训练时只运行一次世界模型：前 256 个固定 anchor 正常参与原有五项 reward 和未来
-语义图监督，另附加 oracle 匹配的 1 条粗轨迹，其未来 token 以停止梯度的方式指导
-轨迹残差。新增
-`loss_future_refinement` 在 oracle 匹配的粗轨迹上监督修正轨迹。训练时把该粗轨迹
-作为第 257 个条件候选并入同一次世界模型前向，因此修正器看到的是这条粗轨迹自身
-导致的未来 BEV；前 256 个固定 anchor 仍单独对应缓存的奖励和未来地图标签，不会把固定候选
-reward标签错误地配给移动后的轨迹。在线推理时完整执行两次共享权重的世界模型：
-第一次指导修正，第二次预测修正轨迹对应的T+4秒未来；两次不是连续预测到T+8秒。
-修正损失权重可通过
-`--future-refinement-loss-weight` 设置，默认值为1.0。
+训练时，第一次世界模型仍对 256 条固定 anchor 运行，负责原有五项 reward 和未来
+语义图监督，并用模型预测的最终 WoTE reward 排序候选。每个样本固定监督 1 条与专家
+轨迹在 24 维坐标中最近的 oracle 候选；另外最多选择 4 条高 reward 粗轨迹，但它们必须
+同时满足终点 XY 误差不超过 2 m、8 点平均 XY 误差不超过 1 m。候选不足时保留空槽掩码，
+不会用无关轨迹补满。选出的 1--5 条粗轨迹再经过一次小规模、停止梯度的世界模型推演，
+因此修正器看到的是每条粗轨迹自身导致的未来 BEV，并学习它到专家轨迹的残差。缓存的
+reward 和未来地图标签始终只与固定 anchor 对齐。
+
+在线推理流程不变：第一次用未来 BEV 指导 256 条粗轨迹修正，第二次预测修正轨迹对应的
+T+4 秒未来并由原 WoTE reward 选择最终轨迹；两次不是连续预测到 T+8 秒。修正损失权重
+由 `--future-refinement-loss-weight` 设置。附加候选数和兼容门槛可分别通过
+`--refinement-reward-topk`、`--refinement-endpoint-max-m` 和
+`--refinement-ade-max-m` 调整，默认值为 4、2.0 m 和 1.0 m。
 
 `latest.pth` 每个 epoch 覆盖保存，`best.pth` 保存最低验证总损失，编号 checkpoint
 默认每5个 epoch及最后一个 epoch保存；可通过 `--save-every` 调整。
@@ -88,6 +91,7 @@ sigmoid 形式用于兼容矿山版可相互重叠的语义图层。
 `metrics.jsonl` 除联合 loss 外，还记录五个评价头各自的 `bce`、`mae`、
 `pred_mean`、`target_mean` 和 `valid_fraction`，以及轨迹的
 `traj_coarse_matched_{ade,fde}_m`、`traj_matched_{ade,fde}_m`、
-`traj_selected_{ade,fde}_m`、`traj_refinement_mean_m` 和
+`traj_coarse_selected_{ade,fde}_m`、`traj_selected_{ade,fde}_m`、
+`traj_refinement_mean_m` 和
 `traj_refinement_max_m`。这些字段均为
 无梯度监控量，不参与 `loss_total`，不会改变训练目标。

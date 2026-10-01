@@ -495,6 +495,66 @@ def select_best_trajectory(final_rewards, trajectories, candidate_indices=None):
         "selected_trajectory": selected,
     }
 
+
+def select_refinement_training_candidates(
+        final_rewards, anchors, coarse_trajectories, future_poses,
+        reward_topk=4, endpoint_max_m=2.0, ade_max_m=1.0):
+    """Select oracle plus reward-preferred, expert-compatible coarse modes.
+
+    The oracle fixed-anchor mode is always supervised. Up to reward_topk
+    additional modes are ranked by the model's own final WoTE reward, but are
+    eligible only when their coarse trajectory remains in the same local
+    driving mode as the recorded expert. Invalid top-k slots are masked rather
+    than filled with unrelated trajectories.
+    """
+    if final_rewards.ndim != 2:
+        raise ValueError("final_rewards must have shape [B,K]")
+    batch, count = final_rewards.shape
+    expected = (batch, count, 8, 3)
+    if anchors.shape != expected or coarse_trajectories.shape != expected:
+        raise ValueError("anchors/coarse trajectories must have shape [B,K,8,3]")
+    if future_poses.shape != (batch, 8, 3):
+        raise ValueError("future_poses must have shape [B,8,3]")
+    if reward_topk < 0 or reward_topk >= count:
+        raise ValueError("reward_topk must be between 0 and K-1")
+    if endpoint_max_m <= 0.0 or ade_max_m <= 0.0:
+        raise ValueError("refinement distance thresholds must be positive")
+
+    anchor_distance = torch.linalg.vector_norm(
+        (anchors - future_poses[:, None]).reshape(batch, count, -1), dim=-1
+    )
+    oracle = anchor_distance.argmin(dim=1)
+    xy_distance = torch.linalg.vector_norm(
+        coarse_trajectories[..., :2] - future_poses[:, None, :, :2], dim=-1
+    )
+    compatible = (
+        (xy_distance[:, :, -1] <= float(endpoint_max_m))
+        & (xy_distance.mean(dim=-1) <= float(ade_max_m))
+        & torch.isfinite(final_rewards)
+    )
+    compatible.scatter_(1, oracle[:, None], False)
+
+    if reward_topk:
+        ranked_rewards = final_rewards.detach().masked_fill(
+            ~compatible, float("-inf")
+        )
+        top_values, top_indices = ranked_rewards.topk(reward_topk, dim=1)
+        top_valid = torch.isfinite(top_values)
+        indices = torch.cat((oracle[:, None], top_indices), dim=1)
+        valid = torch.cat(
+            (torch.ones_like(oracle[:, None], dtype=torch.bool), top_valid), dim=1
+        )
+    else:
+        indices = oracle[:, None]
+        valid = torch.ones_like(indices, dtype=torch.bool)
+
+    reward_selected = final_rewards.detach().argmax(dim=1)
+    reward_selected_supervised = (
+        (reward_selected == oracle)
+        | compatible.gather(1, reward_selected[:, None]).squeeze(1)
+    )
+    return indices, valid, oracle, reward_selected_supervised
+
 """Current-scene auxiliary heads adapted from the WoTE source model.
 
 Reference: WoTE/navsim/agents/WoTE/WoTE_model.py, ``_process_agent`` and
@@ -870,7 +930,8 @@ class WoTEMiningPlanner(nn.Module):
                 world_candidate_indices=None, augmentation_degrees=None,
                 predict_future_map=False, future_map_candidate_indices=None,
                 predict_auxiliary=True, use_refined_world=True,
-                refinement_candidate_indices=None):
+                refinement_target_poses=None, refinement_reward_topk=4,
+                refinement_endpoint_max_m=2.0, refinement_ade_max_m=1.0):
         # WoTE asks the local backbone for its fused 512x8x8 LiDAR map before
         # the legacy TransFuser output heads.
         fused_lidar = self.backbone(
@@ -884,6 +945,7 @@ class WoTEMiningPlanner(nn.Module):
             )
             result["current_map_logits"] = self.world_model.map_head(current_map)[:, :4]
             result.update(self.current_agent_head(result["bev_tokens"]))
+        rewards = None
         if use_refined_world:
             # Online first rollout: each coarse candidate receives its own
             # predicted T+4 s BEV and queries it before the final rollout.
@@ -916,93 +978,87 @@ class WoTEMiningPlanner(nn.Module):
                 ),
             )
         else:
-            # Training/validation labels are cached for all fixed anchors.  A
-            # single differentiable rollout supplies the reward/map branch.
-            # Append the oracle-matched *coarse* trajectory to that same call
-            # so the refiner sees the future caused by exactly the trajectory
-            # it is asked to change, while cached labels remain paired only
-            # with the first 256 fixed anchors.
+            # Cached reward/map labels stay paired with all fixed anchors.
+            # Their predicted final rewards select the actual model-preferred
+            # coarse modes to train, in addition to the oracle anchor mode.
             if world_candidate_indices is not None:
                 raise ValueError(
                     "fixed-anchor future refinement requires the full candidate set"
                 )
             batch, candidate_count = coarse_trajectories.shape[:2]
-            if (refinement_candidate_indices is None
-                    or refinement_candidate_indices.shape != (batch,)
-                    or refinement_candidate_indices.dtype != torch.long):
+            if (refinement_target_poses is None
+                    or refinement_target_poses.shape != (batch, 8, 3)):
                 raise ValueError(
-                    "training refinement_candidate_indices must have shape [B] "
-                    "and dtype int64"
+                    "training refinement_target_poses must have shape [B,8,3]"
                 )
-            if ((refinement_candidate_indices < 0).any()
-                    or (refinement_candidate_indices >= candidate_count).any()):
-                raise ValueError("refinement candidate index is out of range")
-            batch_index = torch.arange(batch, device=coarse_trajectories.device)
-            matched_coarse = coarse_trajectories[
-                batch_index, refinement_candidate_indices
-            ][:, None]
-            matched_query_features = result["offset_features"][
-                batch_index, refinement_candidate_indices
-            ][:, None]
-            matched_world_features = result["anchor_features"][
-                batch_index, refinement_candidate_indices
-            ][:, None]
-            mixed_trajectories = torch.cat(
-                (result["anchors"], matched_coarse), dim=1
-            )
-            mixed_action_features = torch.cat(
-                (result["anchor_features"], matched_world_features), dim=1
-            )
-            mixed_world = self.world_model(
-                result["bev_tokens"], mixed_action_features,
-                mixed_trajectories,
+            world_trajectories = result["anchors"]
+            world_action_features = result["anchor_features"]
+            world = self.world_model(
+                result["bev_tokens"], world_action_features,
+                world_trajectories,
                 augmentation_degrees=augmentation_degrees,
                 predict_future_map=(
                     predict_future_map and future_map_candidate_indices is None
                 ),
             )
-            world_trajectories = result["anchors"]
-            world_action_features = result["anchor_features"]
-            world = {
-                "future_bev_tokens": mixed_world["future_bev_tokens"][
-                    :, :candidate_count
-                ],
-                "future_action_features": mixed_world["future_action_features"][
-                    :, :candidate_count
-                ],
-                "world_trajectories": mixed_world["world_trajectories"][
-                    :, :candidate_count
-                ],
-            }
-            matched_refinement = self.future_trajectory_refiner(
-                matched_query_features,
-                mixed_world["future_bev_tokens"][:, candidate_count:].detach(),
-                matched_coarse,
+            rewards = self.reward_head(
+                result["bev_tokens"], world["future_bev_tokens"],
+                world_action_features, world["future_action_features"],
             )
-            trajectory_index = refinement_candidate_indices[:, None, None, None]
-            trajectory_index = trajectory_index.expand(-1, 1, 8, 3)
-            matched_offsets = matched_refinement[
+            training_indices, training_valid, oracle_index, reward_selected_supervised = (
+                select_refinement_training_candidates(
+                    rewards["final_rewards"], result["anchors"], coarse_trajectories,
+                    refinement_target_poses, reward_topk=int(refinement_reward_topk),
+                    endpoint_max_m=float(refinement_endpoint_max_m),
+                    ade_max_m=float(refinement_ade_max_m),
+                )
+            )
+            trajectory_index = training_indices[:, :, None, None].expand(
+                -1, -1, 8, 3
+            )
+            feature_index = training_indices[:, :, None].expand(
+                -1, -1, result["offset_features"].shape[-1]
+            )
+            training_coarse = coarse_trajectories.gather(1, trajectory_index)
+            training_query_features = result["offset_features"].gather(
+                1, feature_index
+            )
+            training_world_features = result["anchor_features"].gather(
+                1, feature_index
+            )
+            # This rollout supplies conditions only. Stopping its gradient
+            # keeps world/reward supervision attached exclusively to cached
+            # fixed-anchor labels, while each selected coarse mode still sees
+            # the future caused by its own trajectory.
+            with torch.no_grad():
+                training_world = self.world_model(
+                    result["bev_tokens"], training_world_features,
+                    training_coarse, augmentation_degrees=augmentation_degrees,
+                )
+            training_refinement = self.future_trajectory_refiner(
+                training_query_features,
+                training_world["future_bev_tokens"].detach(), training_coarse,
+            )
+            training_offsets = training_refinement[
                 "future_refinement_offsets"
             ].to(dtype=coarse_trajectories.dtype)
-            refinement_offsets = torch.zeros_like(coarse_trajectories).scatter(
-                1, trajectory_index,
-                matched_offsets,
-            )
-            feature_index = refinement_candidate_indices[:, None, None].expand(
-                -1, 1, result["offset_features"].shape[-1]
-            )
-            matched_refinement_features = matched_refinement[
-                "future_refinement_features"
-            ].to(dtype=result["offset_features"].dtype)
-            refinement_features = result["offset_features"].scatter(
-                1, feature_index,
-                matched_refinement_features,
+            valid_trajectory = training_valid[:, :, None, None].to(training_offsets)
+            training_offsets = training_offsets * valid_trajectory
+            refinement_offsets = torch.zeros_like(coarse_trajectories).scatter_add(
+                1, trajectory_index, training_offsets,
             )
             refinement = {
-                "future_refinement_features": refinement_features,
+                "future_refinement_features": result["offset_features"],
                 "future_refinement_offsets": refinement_offsets,
                 "refined_trajectories": coarse_trajectories + refinement_offsets,
             }
+            result.update({
+                "refinement_training_indices": training_indices,
+                "refinement_training_valid": training_valid,
+                "refinement_training_offsets": training_offsets,
+                "refinement_oracle_index": oracle_index,
+                "refinement_reward_selected_supervised": reward_selected_supervised,
+            })
 
         result["coarse_trajectories"] = coarse_trajectories
         result.update(refinement)
@@ -1020,10 +1076,11 @@ class WoTEMiningPlanner(nn.Module):
                     -1, -1, world_action_features.shape[-1]
                 )
             )
-        rewards = self.reward_head(
-            result["bev_tokens"], world["future_bev_tokens"],
-            scored_action_features, world["future_action_features"],
-        )
+        if rewards is None:
+            rewards = self.reward_head(
+                result["bev_tokens"], world["future_bev_tokens"],
+                scored_action_features, world["future_action_features"],
+            )
         result.update(rewards)
         result.update(select_best_trajectory(
             rewards["final_rewards"], world["world_trajectories"],

@@ -48,14 +48,6 @@ class WoTEMiningTrainingModule(nn.Module):
         offsets = torch.arange(sampled, device=future_poses.device)[None]
         return (nearest + offsets) % count
 
-    def _matched_anchor_indices(self, future_poses):
-        """Return the fixed anchor nearest to each recorded expert future."""
-        anchors = self.planner.trajectory_head.anchors.to(future_poses)
-        distance = torch.linalg.vector_norm(
-            (anchors[None] - future_poses[:, None]).flatten(2), dim=-1
-        )
-        return distance.argmin(dim=1)
-
     def forward(self, batch):
         rgb = batch["rgb"].float()
         lidar = batch["lidar"].float()
@@ -65,13 +57,15 @@ class WoTEMiningTrainingModule(nn.Module):
         target_point = batch["target_point"].float()
         future_poses = batch["wote_future_poses"].float()
         future_map_indices = self._future_map_indices(future_poses)
-        refinement_candidate_indices = self._matched_anchor_indices(future_poses)
         return self.planner(
             rgb, lidar, speed, target_point,
             augmentation_degrees=batch["wote_augmentation_degrees"].float(),
             predict_future_map=True,
             future_map_candidate_indices=future_map_indices,
-            refinement_candidate_indices=refinement_candidate_indices,
+            refinement_target_poses=future_poses,
+            refinement_reward_topk=self.config.wote_refinement_reward_topk,
+            refinement_endpoint_max_m=self.config.wote_refinement_endpoint_max_m,
+            refinement_ade_max_m=self.config.wote_refinement_ade_max_m,
             # Cached reward/map targets were generated for the fixed 256
             # anchors.  The future-aware trajectories receive their separate
             # residual imitation loss, but only online CARLA inference sends
@@ -185,10 +179,14 @@ class WoTEMiningTrainingModule(nn.Module):
         # the selected anchor ID to inspect the refined trajectory that would
         # be passed to the world model during online inference.
         selected_index = outputs["selected_index"]
+        coarse_selected_trajectory = outputs["coarse_trajectories"][
+            batch_index, selected_index
+        ]
         selected_trajectory = outputs["trajectories"][batch_index, selected_index]
         for prefix, trajectory in (
             ("traj_coarse_matched", coarse_matched_trajectory),
             ("traj_matched", matched_trajectory),
+            ("traj_coarse_selected", coarse_selected_trajectory),
             ("traj_selected", selected_trajectory),
         ):
             displacement = torch.linalg.vector_norm(
@@ -198,9 +196,8 @@ class WoTEMiningTrainingModule(nn.Module):
             diagnostics[prefix + "_fde_m"] = displacement[:, -1].mean()
             diagnostic_weights[prefix + "_ade_m"] = future.new_tensor(batch_size)
             diagnostic_weights[prefix + "_fde_m"] = future.new_tensor(batch_size)
-        # Training refines only the oracle-matched coarse candidate. Measure
-        # that candidate rather than averaging its correction with 255
-        # deliberately zero, unsupervised slots.
+        # Report the oracle candidate's correction magnitude rather than
+        # averaging it with deliberately zero, unsupervised candidate slots.
         matched_refinement = outputs["future_refinement_offsets"][
             batch_index, nearest
         ]
@@ -213,6 +210,17 @@ class WoTEMiningTrainingModule(nn.Module):
             refinement_xy.numel()
         )
         diagnostic_weights["traj_refinement_max_m"] = future.new_tensor(batch_size)
+        valid_candidates = outputs["refinement_training_valid"].sum(dim=1).float()
+        diagnostics["refinement_supervised_candidates"] = valid_candidates.mean()
+        diagnostic_weights["refinement_supervised_candidates"] = future.new_tensor(
+            batch_size
+        )
+        diagnostics["refinement_reward_selected_supervised_fraction"] = outputs[
+            "refinement_reward_selected_supervised"
+        ].float().mean()
+        diagnostic_weights[
+            "refinement_reward_selected_supervised_fraction"
+        ] = future.new_tensor(batch_size)
         return diagnostics, diagnostic_weights
 
 
@@ -320,7 +328,19 @@ def parse_args():
     parser.add_argument("--future-map-candidates", type=int, default=1)
     parser.add_argument(
         "--future-refinement-loss-weight", type=float, default=1.0,
-        help="weight of the oracle-matched future-aware trajectory loss",
+        help="weight of the supervised future-aware trajectory loss",
+    )
+    parser.add_argument(
+        "--refinement-reward-topk", type=int, default=4,
+        help="additional reward-preferred coarse candidates per observation",
+    )
+    parser.add_argument(
+        "--refinement-endpoint-max-m", type=float, default=2.0,
+        help="maximum endpoint error for an additional refinement candidate",
+    )
+    parser.add_argument(
+        "--refinement-ade-max-m", type=float, default=1.0,
+        help="maximum XY ADE for an additional refinement candidate",
     )
     parser.add_argument("--grad-clip", type=float, default=5.0)
     parser.add_argument("--seed", type=int, default=2026)
@@ -596,7 +616,15 @@ def main():
     config.wote_num_future_map_candidates = args.future_map_candidates
     if args.future_refinement_loss_weight < 0:
         raise ValueError("future refinement loss weight must be nonnegative")
+    if (args.refinement_reward_topk < 0
+            or args.refinement_reward_topk >= config.num_traj_anchors):
+        raise ValueError("refinement reward top-k must be between 0 and anchor count - 1")
+    if args.refinement_endpoint_max_m <= 0 or args.refinement_ade_max_m <= 0:
+        raise ValueError("refinement distance thresholds must be positive")
     config.wote_future_refinement_loss_weight = args.future_refinement_loss_weight
+    config.wote_refinement_reward_topk = args.refinement_reward_topk
+    config.wote_refinement_endpoint_max_m = args.refinement_endpoint_max_m
+    config.wote_refinement_ade_max_m = args.refinement_ade_max_m
     config.wote_lr = args.lr
     config.wote_min_lr = args.min_lr
     config.wote_weight_decay = args.weight_decay

@@ -11,36 +11,33 @@ from torch.nn import functional as F
 
 
 def future_refinement_loss(outputs, future_poses):
-    """Supervise the future-aware refinement on the oracle anchor mode.
-
-    Cached metric targets remain attached to fixed anchors. During training,
-    the oracle-matched coarse trajectory is appended to the fixed-anchor world
-    rollout, so its detached future BEV exactly matches the trajectory being
-    refined. This loss never pairs a moved trajectory with stale reward labels.
-    """
+    """Supervise oracle and eligible reward-preferred coarse modes."""
     anchors = outputs["anchors"]
     coarse = outputs["coarse_trajectories"]
-    predicted_residual = outputs["future_refinement_offsets"]
     if anchors.ndim != 4 or anchors.shape[2:] != (8, 3):
         raise ValueError("anchors must have shape [B,K,8,3]")
     batch, count = anchors.shape[:2]
-    if (coarse.shape != anchors.shape or predicted_residual.shape != anchors.shape
-            or future_poses.shape != (batch, 8, 3)):
+    if coarse.shape != anchors.shape or future_poses.shape != (batch, 8, 3):
         raise ValueError("refined trajectories/future poses have incompatible shapes")
-    distance = torch.linalg.vector_norm(
-        (anchors - future_poses[:, None]).reshape(batch, count, -1), dim=-1
-    )
-    winner = distance.argmin(dim=1)
-    batch_index = torch.arange(batch, device=anchors.device)
-    # The coarse branch already has its own source-style offset loss.  Train
-    # this head on only the remaining residual so the new objective does not
-    # duplicate the gradient into the coarse trajectory coordinates.
-    desired_residual = (
-        future_poses - coarse[batch_index, winner].detach()
-    )
-    return F.smooth_l1_loss(
-        predicted_residual[batch_index, winner], desired_residual
-    )
+    indices = outputs["refinement_training_indices"]
+    valid = outputs["refinement_training_valid"]
+    predicted_residual = outputs["refinement_training_offsets"]
+    selected_count = indices.shape[1]
+    if (indices.shape != (batch, selected_count)
+            or valid.shape != indices.shape
+            or predicted_residual.shape != (batch, selected_count, 8, 3)):
+        raise ValueError("refinement training tensors have incompatible shapes")
+    gather_index = indices[:, :, None, None].expand(-1, -1, 8, 3)
+    selected_coarse = coarse.gather(1, gather_index).detach()
+    desired_residual = future_poses[:, None] - selected_coarse
+    per_candidate = F.smooth_l1_loss(
+        predicted_residual, desired_residual, reduction="none"
+    ).mean(dim=(2, 3))
+    weights = valid.to(per_candidate)
+    # Give each observation equal weight even when fewer reward-preferred
+    # candidates pass the compatibility gate.
+    return ((per_candidate * weights).sum(dim=1)
+            / weights.sum(dim=1).clamp_min(1.0)).mean()
 
 
 def source_style_core_losses(outputs, future_poses, metric_targets=None,
