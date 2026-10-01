@@ -283,9 +283,8 @@ class WoTEMiningInferenceModel(nn.Module):
         selected_metrics = outputs["metric_scores"][batch_index, selected_local]
         selected_rewards = outputs["final_rewards"][batch_index, selected_local]
         refinement_indices = outputs["refinement_inference_indices"]
-        selected_was_refined = (
-            refinement_indices == selected_local[:, None]
-        ).any(dim=1)
+        coarse_candidate_count = outputs["coarse_trajectories"].shape[1]
+        selected_was_refined = selected_local >= coarse_candidate_count
         coarse_selected = outputs["coarse_final_rewards"].argmax(dim=1)
         selected_refinement = outputs["future_refinement_offsets"][
             batch_index, selected_local

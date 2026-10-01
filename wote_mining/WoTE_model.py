@@ -975,7 +975,12 @@ class WoTEMiningPlanner(nn.Module):
             result["current_map_logits"] = self.world_model.map_head(current_map)[:, :4]
             result.update(self.current_agent_head(result["bev_tokens"]))
         rewards = None
+        selection_candidate_indices = world_candidate_indices
         if use_refined_world:
+            if world_candidate_indices is not None:
+                raise ValueError(
+                    "online future refinement requires the full candidate set"
+                )
             # Online first rollout: each coarse candidate receives its own
             # predicted T+4 s BEV and queries it before the final rollout.
             # Keep the fixed candidate identity feature used to train the
@@ -1018,40 +1023,98 @@ class WoTEMiningPlanner(nn.Module):
             selected_offsets = selected_refinement[
                 "future_refinement_offsets"
             ].to(coarse_trajectories)
-            refinement_offsets = torch.zeros_like(coarse_trajectories).scatter(
-                1, trajectory_index, selected_offsets
-            )
-            gate_index = refinement_indices[:, :, None, None].expand(
-                -1, -1, 8, 1
-            )
             selected_gate = selected_refinement["future_refinement_gate"].to(
                 coarse_trajectories
             )
-            refinement_gate = torch.zeros_like(
-                coarse_trajectories[..., :1]
-            ).scatter(1, gate_index, selected_gate)
+            selected_refined = selected_coarse + selected_offsets
+            # Refinement is an additive proposal mechanism: never discard the
+            # original top-k coarse modes. The final candidate set contains
+            # all K coarse trajectories followed by R refined copies.
+            candidate_trajectories = torch.cat(
+                (coarse_trajectories, selected_refined), dim=1
+            )
+            candidate_offsets = torch.cat((
+                torch.zeros_like(coarse_trajectories), selected_offsets,
+            ), dim=1)
+            candidate_gate = torch.cat((
+                torch.zeros_like(coarse_trajectories[..., :1]), selected_gate,
+            ), dim=1)
             refinement = {
-                "future_refinement_features": result["offset_features"],
-                "future_refinement_gate": refinement_gate,
-                "future_refinement_offsets": refinement_offsets,
-                "refined_trajectories": coarse_trajectories + refinement_offsets,
+                "future_refinement_features": torch.cat((
+                    result["offset_features"],
+                    selected_refinement["future_refinement_features"],
+                ), dim=1),
+                "future_refinement_gate": candidate_gate,
+                "future_refinement_offsets": candidate_offsets,
+                "refined_trajectories": candidate_trajectories,
             }
             result["coarse_final_rewards"] = coarse_rewards["final_rewards"]
             result["refinement_inference_indices"] = refinement_indices
-            # The final rollout still evaluates all 256 trajectories. Modes
-            # outside the pre-score top-k remain unchanged coarse trajectories.
-            world_trajectories = refinement["refined_trajectories"]
-            world_action_features = self.trajectory_head.encode_trajectory_features(
-                world_trajectories, speed, target_point
+            coarse_candidate_indices = torch.arange(
+                candidate_count, device=coarse_trajectories.device,
+                dtype=torch.long,
+            ).unsqueeze(0).expand(batch, -1)
+            selection_candidate_indices = torch.cat(
+                (coarse_candidate_indices, refinement_indices), dim=1
             )
-            world = self.world_model(
-                result["bev_tokens"], world_action_features,
-                world_trajectories, candidate_indices=world_candidate_indices,
+            result["candidate_anchor_indices"] = selection_candidate_indices
+
+            # Only the R appended proposals need a second transition. Their
+            # fixed anchor identities match training; their coordinates carry
+            # the actual refined action seen by the world model.
+            selected_anchor_features = coarse_action_features.gather(
+                1, feature_index
+            )
+            refined_world = self.world_model(
+                result["bev_tokens"], selected_anchor_features,
+                selected_refined,
                 augmentation_degrees=augmentation_degrees,
-                predict_future_map=(
-                    predict_future_map and future_map_candidate_indices is None
-                ),
             )
+            refined_rewards = self.reward_head(
+                result["bev_tokens"], refined_world["future_bev_tokens"],
+                selected_anchor_features,
+                refined_world["future_action_features"],
+            )
+            world_trajectories = candidate_trajectories
+            world_action_features = torch.cat(
+                (coarse_action_features, selected_anchor_features), dim=1
+            )
+            world = {
+                "future_bev_tokens": torch.cat((
+                    coarse_world["future_bev_tokens"],
+                    refined_world["future_bev_tokens"],
+                ), dim=1),
+                "future_action_features": torch.cat((
+                    coarse_world["future_action_features"],
+                    refined_world["future_action_features"],
+                ), dim=1),
+                "world_trajectories": candidate_trajectories,
+            }
+            # The imitation term is normalized across candidates. Concatenate
+            # raw logits and compose once over all K+R candidates; concatenating
+            # separately normalized final rewards would make them incomparable.
+            imitation_logits = torch.cat((
+                coarse_rewards["imitation_logits"],
+                refined_rewards["imitation_logits"],
+            ), dim=1)
+            metric_logits = torch.cat((
+                coarse_rewards["metric_logits"],
+                refined_rewards["metric_logits"],
+            ), dim=1)
+            final_rewards, imitation_probs, metric_scores = (
+                self.reward_head.compose_rewards(imitation_logits, metric_logits)
+            )
+            rewards = {
+                "reward_features": torch.cat((
+                    coarse_rewards["reward_features"],
+                    refined_rewards["reward_features"],
+                ), dim=1),
+                "imitation_logits": imitation_logits,
+                "imitation_probs": imitation_probs,
+                "metric_logits": metric_logits,
+                "metric_scores": metric_scores,
+                "final_rewards": final_rewards,
+            }
         else:
             # Cached reward/map labels stay paired with all fixed anchors.
             # Their predicted final rewards select the actual model-preferred
@@ -1155,15 +1218,15 @@ class WoTEMiningPlanner(nn.Module):
             result.update(self.world_model.decode_future_map(
                 world, future_map_candidate_indices
             ))
-        if world_candidate_indices is None:
-            scored_action_features = world_action_features
-        else:
-            scored_action_features = world_action_features.gather(
-                1, world_candidate_indices.unsqueeze(-1).expand(
-                    -1, -1, world_action_features.shape[-1]
-                )
-            )
         if rewards is None:
+            if world_candidate_indices is None:
+                scored_action_features = world_action_features
+            else:
+                scored_action_features = world_action_features.gather(
+                    1, world_candidate_indices.unsqueeze(-1).expand(
+                        -1, -1, world_action_features.shape[-1]
+                    )
+                )
             rewards = self.reward_head(
                 result["bev_tokens"], world["future_bev_tokens"],
                 scored_action_features, world["future_action_features"],
@@ -1171,6 +1234,6 @@ class WoTEMiningPlanner(nn.Module):
         result.update(rewards)
         result.update(select_best_trajectory(
             rewards["final_rewards"], world["world_trajectories"],
-            world_candidate_indices,
+            selection_candidate_indices,
         ))
         return result
