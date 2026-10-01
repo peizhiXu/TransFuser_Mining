@@ -83,7 +83,8 @@ class WoTEMiningTrainingModule(nn.Module):
         core.pop("matched_anchor")
         raw = dict(core)
         raw["loss_future_refinement"] = future_refinement_loss(
-            outputs, batch["wote_future_poses"].float()
+            outputs, batch["wote_future_poses"].float(),
+            identity_loss_weight=self.config.wote_refinement_identity_loss_weight,
         )
         raw["loss_current_map"] = current_semantic_map_loss(
             outputs["current_map_logits"],
@@ -210,6 +211,23 @@ class WoTEMiningTrainingModule(nn.Module):
             refinement_xy.numel()
         )
         diagnostic_weights["traj_refinement_max_m"] = future.new_tensor(batch_size)
+        valid_gate = outputs["refinement_training_valid"].float()
+        training_gate = outputs["refinement_training_gate"].float().squeeze(-1)
+        diagnostics["refinement_training_gate_mean"] = (
+            (training_gate * valid_gate[..., None]).sum()
+            / (valid_gate.sum() * training_gate.shape[-1]).clamp_min(1.0)
+        )
+        diagnostics["refinement_oracle_gate_mean"] = training_gate[:, 0].mean()
+        selected_gate = outputs["future_refinement_gate"][
+            batch_index, selected_index
+        ]
+        diagnostics["refinement_selected_gate_mean"] = selected_gate.mean()
+        for name in (
+            "refinement_training_gate_mean",
+            "refinement_oracle_gate_mean",
+            "refinement_selected_gate_mean",
+        ):
+            diagnostic_weights[name] = future.new_tensor(batch_size)
         valid_candidates = outputs["refinement_training_valid"].sum(dim=1).float()
         diagnostics["refinement_supervised_candidates"] = valid_candidates.mean()
         diagnostic_weights["refinement_supervised_candidates"] = future.new_tensor(
@@ -329,6 +347,10 @@ def parse_args():
     parser.add_argument(
         "--future-refinement-loss-weight", type=float, default=1.0,
         help="weight of the supervised future-aware trajectory loss",
+    )
+    parser.add_argument(
+        "--refinement-identity-loss-weight", type=float, default=0.1,
+        help="penalty on changing coarse paths already close to the expert",
     )
     parser.add_argument(
         "--refinement-reward-topk", type=int, default=4,
@@ -616,12 +638,15 @@ def main():
     config.wote_num_future_map_candidates = args.future_map_candidates
     if args.future_refinement_loss_weight < 0:
         raise ValueError("future refinement loss weight must be nonnegative")
+    if args.refinement_identity_loss_weight < 0:
+        raise ValueError("refinement identity loss weight must be nonnegative")
     if (args.refinement_reward_topk < 0
             or args.refinement_reward_topk >= config.num_traj_anchors):
         raise ValueError("refinement reward top-k must be between 0 and anchor count - 1")
     if args.refinement_endpoint_max_m <= 0 or args.refinement_ade_max_m <= 0:
         raise ValueError("refinement distance thresholds must be positive")
     config.wote_future_refinement_loss_weight = args.future_refinement_loss_weight
+    config.wote_refinement_identity_loss_weight = args.refinement_identity_loss_weight
     config.wote_refinement_reward_topk = args.refinement_reward_topk
     config.wote_refinement_endpoint_max_m = args.refinement_endpoint_max_m
     config.wote_refinement_ade_max_m = args.refinement_ade_max_m

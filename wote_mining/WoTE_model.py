@@ -840,12 +840,26 @@ class WoTEFutureTrajectoryRefiner(nn.Module):
             nn.Linear(2 * hidden_dim, hidden_dim), nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
+        self.pose_encoder = nn.Sequential(
+            nn.Linear(24, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
         self.output_norm = nn.LayerNorm(hidden_dim)
         self.refinement_head = nn.Linear(hidden_dim, 24)
-        # Before learning, the refined trajectory is exactly equal to the
-        # existing WoTE trajectory even though the future-aware path is active.
+        self.refinement_gate_head = nn.Linear(hidden_dim, 8)
+        self.register_buffer(
+            "pose_scale", torch.tensor([32.0, 16.0, math.pi]).reshape(1, 1, 1, 3),
+            persistent=False,
+        )
+        self.register_buffer(
+            "refinement_scale", torch.tensor([2.0, 2.0, 0.35]).reshape(1, 1, 1, 3),
+            persistent=False,
+        )
+        # Zero residuals preserve the original WoTE trajectory at initialization.
         nn.init.zeros_(self.refinement_head.weight)
         nn.init.zeros_(self.refinement_head.bias)
+        nn.init.zeros_(self.refinement_gate_head.weight)
+        nn.init.constant_(self.refinement_gate_head.bias, -1.0)
 
     def forward(self, candidate_features, future_bev_tokens, trajectories):
         if candidate_features.ndim != 3:
@@ -858,12 +872,16 @@ class WoTEFutureTrajectoryRefiner(nn.Module):
         if trajectories.shape != (batch, count, 8, 3):
             raise ValueError("trajectories must have shape [B,K,8,3]")
 
+        pose_features = self.pose_encoder(
+            (trajectories / self.pose_scale.to(trajectories)).flatten(2)
+        )
+        candidate_context = candidate_features + pose_features
         refined_feature_chunks = []
         for start in range(0, count, self.candidate_chunk):
             stop = min(start + self.candidate_chunk, count)
             chunk = stop - start
             query = self.query_norm(
-                candidate_features[:, start:stop]
+                candidate_context[:, start:stop]
             ).reshape(batch * chunk, 1, channels)
             memory = self.future_norm(
                 future_bev_tokens[:, start:stop]
@@ -871,7 +889,7 @@ class WoTEFutureTrajectoryRefiner(nn.Module):
             future_feature, _ = self.future_attention(
                 query, memory, memory, need_weights=False
             )
-            current_feature = candidate_features[:, start:stop].reshape(
+            current_feature = candidate_context[:, start:stop].reshape(
                 batch * chunk, channels
             )
             future_feature = future_feature[:, 0]
@@ -883,11 +901,17 @@ class WoTEFutureTrajectoryRefiner(nn.Module):
             )
 
         refined_features = torch.cat(refined_feature_chunks, dim=1)
-        refinement_offsets = self.refinement_head(refined_features).reshape(
+        raw_offsets = self.refinement_head(refined_features).reshape(
             batch, count, 8, 3
         )
+        gate = torch.sigmoid(self.refinement_gate_head(refined_features)).reshape(
+            batch, count, 8, 1
+        )
+        scale = self.refinement_scale.to(raw_offsets)
+        refinement_offsets = scale * torch.tanh(raw_offsets / scale) * gate
         return {
             "future_refinement_features": refined_features,
+            "future_refinement_gate": gate,
             "future_refinement_offsets": refinement_offsets,
             "refined_trajectories": trajectories + refinement_offsets,
         }
@@ -1035,20 +1059,31 @@ class WoTEMiningPlanner(nn.Module):
                     result["bev_tokens"], training_world_features,
                     training_coarse, augmentation_degrees=augmentation_degrees,
                 )
+            # Train the correction head without its loss changing the coarse
+            # trajectory decoder; the original WoTE losses train that branch.
             training_refinement = self.future_trajectory_refiner(
-                training_query_features,
-                training_world["future_bev_tokens"].detach(), training_coarse,
+                training_query_features.detach(),
+                training_world["future_bev_tokens"].detach(),
+                training_coarse.detach(),
             )
             training_offsets = training_refinement[
                 "future_refinement_offsets"
             ].to(dtype=coarse_trajectories.dtype)
             valid_trajectory = training_valid[:, :, None, None].to(training_offsets)
             training_offsets = training_offsets * valid_trajectory
+            training_gate = training_refinement["future_refinement_gate"].to(
+                dtype=coarse_trajectories.dtype
+            ) * valid_trajectory
             refinement_offsets = torch.zeros_like(coarse_trajectories).scatter_add(
                 1, trajectory_index, training_offsets,
             )
+            gate_index = training_indices[:, :, None, None].expand(-1, -1, 8, 1)
+            refinement_gate = torch.zeros_like(
+                coarse_trajectories[..., :1]
+            ).scatter_add(1, gate_index, training_gate)
             refinement = {
                 "future_refinement_features": result["offset_features"],
+                "future_refinement_gate": refinement_gate,
                 "future_refinement_offsets": refinement_offsets,
                 "refined_trajectories": coarse_trajectories + refinement_offsets,
             }
@@ -1056,6 +1091,7 @@ class WoTEMiningPlanner(nn.Module):
                 "refinement_training_indices": training_indices,
                 "refinement_training_valid": training_valid,
                 "refinement_training_offsets": training_offsets,
+                "refinement_training_gate": training_gate,
                 "refinement_oracle_index": oracle_index,
                 "refinement_reward_selected_supervised": reward_selected_supervised,
             })

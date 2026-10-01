@@ -10,8 +10,10 @@ import torch
 from torch.nn import functional as F
 
 
-def future_refinement_loss(outputs, future_poses):
-    """Supervise oracle and eligible reward-preferred coarse modes."""
+def future_refinement_loss(outputs, future_poses, identity_loss_weight=0.1):
+    """Refine expert-compatible modes while preserving accurate coarse paths."""
+    if identity_loss_weight < 0:
+        raise ValueError("identity_loss_weight must be nonnegative")
     anchors = outputs["anchors"]
     coarse = outputs["coarse_trajectories"]
     if anchors.ndim != 4 or anchors.shape[2:] != (8, 3):
@@ -33,11 +35,23 @@ def future_refinement_loss(outputs, future_poses):
     per_candidate = F.smooth_l1_loss(
         predicted_residual, desired_residual, reduction="none"
     ).mean(dim=(2, 3))
-    weights = valid.to(per_candidate)
-    # Give each observation equal weight even when fewer reward-preferred
-    # candidates pass the compatibility gate.
-    return ((per_candidate * weights).sum(dim=1)
-            / weights.sum(dim=1).clamp_min(1.0)).mean()
+    # The oracle and the highest-ranked compatible reward choice matter most.
+    # Other reward modes contribute without overpowering a good oracle path.
+    rank_weights = per_candidate.new_full((selected_count,), 0.25)
+    rank_weights[0] = 2.0
+    if selected_count > 1:
+        rank_weights[1] = 1.0
+    weights = valid.to(per_candidate) * rank_weights[None]
+    normalizer = weights.sum(dim=1).clamp_min(1.0)
+    imitation = (per_candidate * weights).sum(dim=1) / normalizer
+
+    coarse_xy_ade = torch.linalg.vector_norm(
+        selected_coarse[..., :2] - future_poses[:, None, :, :2], dim=-1
+    ).mean(dim=-1)
+    near_expert = (1.0 - coarse_xy_ade / 0.5).clamp(0.0, 1.0).detach()
+    correction_xy = predicted_residual[..., :2].square().mean(dim=(2, 3))
+    identity = (correction_xy * near_expert * weights).sum(dim=1) / normalizer
+    return (imitation + float(identity_loss_weight) * identity).mean()
 
 
 def source_style_core_losses(outputs, future_poses, metric_targets=None,

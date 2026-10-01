@@ -28,6 +28,7 @@ class WoTEMiningConfig(GlobalConfig):
     wote_num_future_map_candidates = 1
     wote_traj_offset_loss_weight = 1.0
     wote_future_refinement_loss_weight = 1.0
+    wote_refinement_identity_loss_weight = 0.1
     # Refine the oracle mode plus reward-preferred coarse candidates which
     # remain close enough to the recorded expert to share its supervision.
     wote_refinement_reward_topk = 4
