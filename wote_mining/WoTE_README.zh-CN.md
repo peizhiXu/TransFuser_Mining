@@ -74,6 +74,9 @@ imitation softmax 和综合奖励合成，保证原始候选与修正候选可�
 `--refinement-ade-max-m` 调整，默认值为 4、2.0 m 和 1.0 m。
 训练挑候选仍使用固定 anchor 的奖励；若要改为粗轨迹奖励，需另增一次256条候选的推演。
 
+闭环消融可设置 `WOTE_COARSE_ONLY=1`：仍执行完整的256+4条推理，但最终只按
+第一次奖励在256条原始粗轨迹中选取控制轨迹；不设置时保持原有选择逻辑。
+
 `latest.pth` 每个 epoch 覆盖保存，`best.pth` 保存最低验证总损失，编号 checkpoint
 默认每5个 epoch及最后一个 epoch保存；可通过 `--save-every` 调整。
 

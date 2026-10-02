@@ -2,6 +2,7 @@
 
 from collections import deque
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -124,6 +125,7 @@ class WoTEMiningInferenceModel(nn.Module):
         self.planner = planner
         self.config = config
         self.controller = HD465TrajectoryController(config)
+        self.coarse_only = os.environ.get('WOTE_COARSE_ONLY', '0') == '1'
         self.last_diagnostics = {}
         self.debug_step = 0
         self._pending_debug = None
@@ -277,15 +279,27 @@ class WoTEMiningInferenceModel(nn.Module):
             predict_future_map=False,
             predict_auxiliary=False,
         )
-        selected = outputs["selected_trajectory"]
-        batch_index = torch.arange(selected.shape[0], device=selected.device)
-        selected_local = outputs["selected_index"]
-        selected_metrics = outputs["metric_scores"][batch_index, selected_local]
-        selected_rewards = outputs["final_rewards"][batch_index, selected_local]
-        refinement_indices = outputs["refinement_inference_indices"]
-        coarse_candidate_count = outputs["coarse_trajectories"].shape[1]
-        selected_was_refined = selected_local >= coarse_candidate_count
+        coarse = outputs["coarse_trajectories"]
+        batch_index = torch.arange(coarse.shape[0], device=coarse.device)
         coarse_selected = outputs["coarse_final_rewards"].argmax(dim=1)
+        if self.coarse_only:
+            selected_local = coarse_selected
+            selected = coarse[batch_index, selected_local]
+            selected_rewards = outputs["coarse_final_rewards"][
+                batch_index, selected_local
+            ]
+            selected_anchor_index = selected_local
+        else:
+            selected_local = outputs["selected_index"]
+            selected = outputs["selected_trajectory"]
+            selected_rewards = outputs["final_rewards"][
+                batch_index, selected_local
+            ]
+            selected_anchor_index = outputs["selected_anchor_index"]
+        selected_metrics = outputs["metric_scores"][batch_index, selected_local]
+        refinement_indices = outputs["refinement_inference_indices"]
+        coarse_candidate_count = coarse.shape[1]
+        selected_was_refined = selected_local >= coarse_candidate_count
         selected_refinement = outputs["future_refinement_offsets"][
             batch_index, selected_local
         ]
@@ -294,8 +308,9 @@ class WoTEMiningInferenceModel(nn.Module):
         )
         self.last_diagnostics = {
             "selected_anchor_index": int(
-                outputs["selected_anchor_index"][0].detach().cpu()
+                selected_anchor_index[0].detach().cpu()
             ),
+            "coarse_only_mode": self.coarse_only,
             "selected_reward": float(selected_rewards[0].detach().cpu()),
             "selected_was_refined": bool(
                 selected_was_refined[0].detach().cpu()
@@ -335,7 +350,6 @@ class WoTEMiningInferenceModel(nn.Module):
 
 """CARLA Leaderboard entry point for the HD465 WoTE planner."""
 
-import os
 import sys
 from pathlib import Path
 
@@ -376,6 +390,9 @@ class WoTEMiningAgent(HybridAgent):
                     'rgb_panorama', 'lidar_bev', 'selected_trajectory',
                     'selected_anchor', 'reward_metrics', 'vehicle_control',
                 ]
+                metadata['wote_coarse_only'] = os.environ.get(
+                    'WOTE_COARSE_ONLY', '0'
+                ) == '1'
                 with metadata_path.open('w', encoding='utf-8') as stream:
                     json.dump(metadata, stream, indent=2)
 
