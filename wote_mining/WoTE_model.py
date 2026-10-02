@@ -634,7 +634,7 @@ from torch.nn import functional as F
 
 
 class WoTEMiningTrajectoryHead(nn.Module):
-    """Refine fixed [K,8,3] anchors against fused 8x8 LiDAR features."""
+    """Decode anchor offsets from the current and predicted future BEV."""
 
     def __init__(self, anchors_path, hidden_dim=256, layers=2, heads=8):
         super().__init__()
@@ -674,6 +674,19 @@ class WoTEMiningTrajectoryHead(nn.Module):
             ),
             num_layers=layers,
         )
+        # The same candidate query reads its own predicted future BEV.  This
+        # is the second BEV input of the original trajectory decoder, not a
+        # post-hoc trajectory refiner.
+        self.future_query_norm = nn.LayerNorm(hidden_dim)
+        self.future_bev_norm = nn.LayerNorm(hidden_dim)
+        self.future_bev_attention = nn.MultiheadAttention(
+            hidden_dim, heads, dropout=0.1, batch_first=True
+        )
+        self.bev_read_fusion = nn.Sequential(
+            nn.Linear(hidden_dim * 3, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.future_candidate_chunk = 16
         self.offset_head = nn.Linear(hidden_dim, 24)
         self.score_head = nn.Linear(hidden_dim, 1)
         # Start exactly on the fixed anchor distribution before training.
@@ -681,10 +694,10 @@ class WoTEMiningTrajectoryHead(nn.Module):
         nn.init.zeros_(self.offset_head.bias)
 
     def encode_trajectory_features(self, trajectories, speed, target_point):
-        """Encode fixed or refined trajectories without BEV offset decoding.
+        """Encode fixed or decoded trajectories without BEV offset decoding.
 
         Source WoTE uses fixed-anchor features to train its world/reward
-        models and re-encodes refined trajectories only for online inference.
+        models and re-encodes decoded trajectories only for online inference.
         Keeping this operation explicit prevents cached fixed-anchor labels
         from being paired with a moving ``anchor + offset`` input.
         """
@@ -702,6 +715,56 @@ class WoTEMiningTrajectoryHead(nn.Module):
         return self.query_fusion(
             torch.cat((trajectory_features, status_feature), dim=-1)
         )
+
+    def fuse_future_bev(self, outputs, future_bev_tokens):
+        """Finish the original anchor-offset decode with a future-BEV read.
+
+        Each fixed-anchor query attends only to the future BEV predicted for
+        that same anchor.  The current-BEV read, future-BEV read, and original
+        query are fused before the existing offset and score heads.
+        """
+        anchors = outputs["anchors"]
+        anchor_features = outputs["anchor_features"]
+        current_bev_features = outputs["offset_features"]
+        if anchors.ndim != 4 or anchors.shape[2:] != (8, 3):
+            raise ValueError("anchors must have shape [B,K,8,3]")
+        batch, count = anchors.shape[:2]
+        expected_features = (batch, count, self.offset_head.in_features)
+        if anchor_features.shape != expected_features:
+            raise ValueError("anchor_features must have shape [B,K,C]")
+        if current_bev_features.shape != expected_features:
+            raise ValueError("offset_features must have shape [B,K,C]")
+        if future_bev_tokens.shape != (
+            batch, count, BEV_SIDE ** 2, self.offset_head.in_features
+        ):
+            raise ValueError("future_bev_tokens must have shape [B,K,64,C]")
+
+        future_reads = []
+        for start in range(0, count, self.future_candidate_chunk):
+            stop = min(start + self.future_candidate_chunk, count)
+            chunk = stop - start
+            query = self.future_query_norm(
+                anchor_features[:, start:stop]
+            ).reshape(batch * chunk, 1, -1)
+            memory = self.future_bev_norm(
+                future_bev_tokens[:, start:stop]
+            ).reshape(batch * chunk, BEV_SIDE ** 2, -1)
+            future_read, _ = self.future_bev_attention(
+                query, memory, memory, need_weights=False
+            )
+            future_reads.append(future_read.reshape(batch, chunk, -1))
+        future_bev_features = torch.cat(future_reads, dim=1)
+        decoded = self.bev_read_fusion(torch.cat((
+            anchor_features, current_bev_features, future_bev_features,
+        ), dim=-1))
+        offsets = self.offset_head(decoded).reshape_as(anchors)
+        return {
+            "offsets": offsets,
+            "trajectories": anchors + offsets,
+            "scores": self.score_head(decoded).squeeze(-1),
+            "offset_features": decoded,
+            "future_bev_features": future_bev_features,
+        }
 
     def forward(self, fused_lidar, speed, target_point):
         if fused_lidar.ndim != 4 or fused_lidar.shape[1:] != (512, 8, 8):
@@ -756,7 +819,7 @@ class WoTEMiningTrajectoryHead(nn.Module):
 
 
 class WoTEMiningPlanner(nn.Module):
-    """Connect the unchanged mining TransFuser fusion backbone to WoTE queries."""
+    """Connect TransFuser to WoTE queries with current/future BEV fusion."""
 
     def __init__(self, backbone, anchors_path):
         super().__init__()
@@ -788,7 +851,7 @@ class WoTEMiningPlanner(nn.Module):
     def forward(self, rgb, lidar_bev, speed, target_point,
                 world_candidate_indices=None, augmentation_degrees=None,
                 predict_future_map=False, future_map_candidate_indices=None,
-                predict_auxiliary=True, use_refined_world=True):
+                predict_auxiliary=True, use_fused_world=True):
         # WoTE asks the local backbone for its fused 512x8x8 LiDAR map before
         # the legacy TransFuser output heads.
         fused_lidar = self.backbone(
@@ -801,36 +864,77 @@ class WoTEMiningPlanner(nn.Module):
             )
             result["current_map_logits"] = self.world_model.map_head(current_map)[:, :4]
             result.update(self.current_agent_head(result["bev_tokens"]))
-        if use_refined_world:
-            world_trajectories = result["trajectories"]
-            world_action_features = self.trajectory_head.encode_trajectory_features(
-                world_trajectories, speed, target_point
-            )
-        else:
-            # Training and validation labels are cached for the fixed anchors.
-            world_trajectories = result["anchors"]
-            world_action_features = result["anchor_features"]
-        world = self.world_model(
-            result["bev_tokens"], world_action_features,
-            world_trajectories, candidate_indices=world_candidate_indices,
+        # World model 1 predicts one future BEV for every original fixed
+        # anchor.  The trajectory head then uses that candidate-aligned BEV as
+        # its second visual input while retaining WoTE's anchor + offset form.
+        anchor_world = self.world_model(
+            result["bev_tokens"], result["anchor_features"], result["anchors"],
             augmentation_degrees=augmentation_degrees,
-            predict_future_map=(
-                predict_future_map and future_map_candidate_indices is None
-            ),
+            predict_future_map=False,
         )
-        result.update(world)
-        if predict_future_map and future_map_candidate_indices is not None:
-            result.update(self.world_model.decode_future_map(
-                world, future_map_candidate_indices
-            ))
-        if world_candidate_indices is None:
-            scored_action_features = world_action_features
-        else:
-            scored_action_features = world_action_features.gather(
-                1, world_candidate_indices.unsqueeze(-1).expand(
-                    -1, -1, world_action_features.shape[-1]
-                )
+        result.update(self.trajectory_head.fuse_future_bev(
+            result, anchor_world["future_bev_tokens"]
+        ))
+
+        if use_fused_world:
+            # World model 2 evaluates the consequences of the complete fused
+            # trajectories.  Reward is still evaluated only once, below.
+            world_action_features = self.trajectory_head.encode_trajectory_features(
+                result["trajectories"], speed, target_point
             )
+            world = self.world_model(
+                result["bev_tokens"], world_action_features,
+                result["trajectories"], candidate_indices=world_candidate_indices,
+                augmentation_degrees=augmentation_degrees,
+                predict_future_map=False,
+            )
+            if world_candidate_indices is None:
+                scored_action_features = world_action_features
+            else:
+                scored_action_features = world_action_features.gather(
+                    1, world_candidate_indices.unsqueeze(-1).expand(
+                        -1, -1, world_action_features.shape[-1]
+                    )
+                )
+        else:
+            # Cached training labels remain aligned with the original fixed
+            # anchors, exactly as in the wote-mining baseline.
+            if world_candidate_indices is None:
+                world = anchor_world
+                scored_action_features = result["anchor_features"]
+            else:
+                selected = world_candidate_indices
+                world = {
+                    "future_bev_tokens": anchor_world["future_bev_tokens"].gather(
+                        1, selected[:, :, None, None].expand(
+                            -1, -1, BEV_SIDE ** 2,
+                            anchor_world["future_bev_tokens"].shape[-1],
+                        )
+                    ),
+                    "future_action_features": anchor_world[
+                        "future_action_features"
+                    ].gather(
+                        1, selected.unsqueeze(-1).expand(
+                            -1, -1,
+                            anchor_world["future_action_features"].shape[-1],
+                        )
+                    ),
+                    "world_trajectories": anchor_world["world_trajectories"].gather(
+                        1, selected[:, :, None, None].expand(-1, -1, 8, 3)
+                    ),
+                }
+                scored_action_features = result["anchor_features"].gather(
+                    1, selected.unsqueeze(-1).expand(
+                        -1, -1, result["anchor_features"].shape[-1]
+                    )
+                )
+
+        result.update(world)
+        if predict_future_map:
+            # Map supervision also stays on world model 1 / fixed anchors.
+            result.update(self.world_model.decode_future_map(
+                anchor_world, future_map_candidate_indices
+            ))
         rewards = self.reward_head(
             result["bev_tokens"], world["future_bev_tokens"],
             scored_action_features, world["future_action_features"],

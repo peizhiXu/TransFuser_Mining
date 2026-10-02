@@ -32,9 +32,34 @@ CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run \
 入口根据 `assets/metric_cache/{train,val}/manifest.json` 直接从 `raw/`
 解析120条训练路线和20条验证路线，不需要建立第二份数据集或恢复旧 split。
 
-训练标签对应固定的256条 anchor，因此训练和验证阶段的世界模型、reward head
-都使用固定 anchor；轨迹 offset 分支仍正常学习。CARLA 在线推理时才将修正后的
-轨迹送入世界模型评价，这与原版 WoTE 的训练/推理设计一致。
+## 当前/未来 BEV 融合
+
+本分支只在原版 WoTE 的轨迹解码位置加入未来 BEV，候选、轨迹表示和训练目标均不变：
+
+```text
+固定 anchors / 原候选 queries
+            │
+            ├── cross-attention 读取当前 BEV ──┐
+            │                                  ├── 特征融合
+世界模型①按每条 anchor 预测未来 BEV           │
+            └── 同一 query 读取对应未来 BEV ──┘
+                                               │
+                              原 offset_head 输出 offset
+                                               │
+                                  trajectory = anchor + offset
+                                               │
+                                   世界模型②（仅在线推理）
+                                               │
+                                         reward 一次
+```
+
+这里的 `anchor + offset` 就是原版 WoTE 的轨迹生成方式，不是生成轨迹后的修正器。
+实现中没有额外的绝对轨迹头、残差修正器、门控、top-k 或新增轨迹损失；原来的
+WTA offset loss、候选 imitation loss、固定 anchor 奖励标签和地图标签都保留。
+
+训练标签对应固定的256条 anchor，因此训练和验证阶段的世界模型①、reward head
+和地图监督仍使用固定 anchors；融合后的 offset/scores 直接接受原版轨迹损失。
+CARLA 在线推理时，融合后生成的完整轨迹再进入世界模型②，最后只计算一次奖励。
 
 `latest.pth` 每个 epoch 覆盖保存，`best.pth` 保存最低验证总损失，编号 checkpoint
 默认每5个 epoch及最后一个 epoch保存；可通过 `--save-every` 调整。

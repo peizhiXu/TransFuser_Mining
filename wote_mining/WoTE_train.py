@@ -63,9 +63,10 @@ class WoTEMiningTrainingModule(nn.Module):
             predict_future_map=True,
             future_map_candidate_indices=future_map_indices,
             # Both train and validation targets were generated for the fixed
-            # 256 anchors.  Refined trajectories are used only by the online
-            # CARLA agent, matching the source WoTE train/eval split.
-            use_refined_world=False,
+            # 256 anchors.  The original reward/map supervision therefore
+            # remains on world model 1, while the original offset losses train
+            # the current/future-BEV fused trajectory decoder.
+            use_fused_world=False,
         )
 
     def compute_losses(self, batch, outputs):
@@ -164,8 +165,8 @@ class WoTEMiningTrainingModule(nn.Module):
         matched_trajectory = outputs["trajectories"][batch_index, nearest]
 
         # During training the reward labels correspond to fixed anchors. Use
-        # the selected anchor ID to inspect the refined trajectory that would
-        # be passed to the world model during online inference.
+        # the selected anchor ID to inspect the fused trajectory that would be
+        # passed to world model 2 during online inference.
         selected_index = outputs["selected_index"]
         selected_trajectory = outputs["trajectories"][batch_index, selected_index]
         for prefix, trajectory in (
