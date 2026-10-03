@@ -16,7 +16,11 @@ if str(ROOT) not in sys.path:
 import torch
 from torch import nn
 
-from wote_mining.WoTE_loss import source_style_core_losses
+from wote_mining.WoTE_loss import (
+    reward_topk_trajectory_loss,
+    select_reward_topk_training_candidates,
+    source_style_core_losses,
+)
 from wote_mining.WoTE_model import METRIC_NAMES, current_semantic_map_loss
 
 
@@ -27,6 +31,9 @@ class WoTEMiningTrainingModule(nn.Module):
         super().__init__()
         self.planner = planner
         self.config = config
+        if (not math.isfinite(config.wote_reward_topk_loss_weight)
+                or config.wote_reward_topk_loss_weight < 0.0):
+            raise ValueError("reward top-k loss weight must be finite and nonnegative")
 
     def _future_map_indices(self, future_poses):
         batch = future_poses.shape[0]
@@ -57,7 +64,7 @@ class WoTEMiningTrainingModule(nn.Module):
         target_point = batch["target_point"].float()
         future_poses = batch["wote_future_poses"].float()
         future_map_indices = self._future_map_indices(future_poses)
-        return self.planner(
+        outputs = self.planner(
             rgb, lidar, speed, target_point,
             augmentation_degrees=batch["wote_augmentation_degrees"].float(),
             predict_future_map=True,
@@ -68,6 +75,17 @@ class WoTEMiningTrainingModule(nn.Module):
             # the current/future-BEV fused trajectory decoder.
             use_fused_world=False,
         )
+        # No new planner modules or world/reward rollout. Selection is solely
+        # a training/validation bookkeeping step and never runs in the agent.
+        topk = (self.config.wote_reward_topk
+                if self.config.wote_reward_topk_loss_weight > 0.0 else 0)
+        outputs.update(select_reward_topk_training_candidates(
+            outputs["final_rewards"], outputs["anchors"], outputs["trajectories"],
+            future_poses, reward_topk=topk,
+            endpoint_max_m=self.config.wote_reward_topk_endpoint_max_m,
+            ade_max_m=self.config.wote_reward_topk_ade_max_m,
+        ))
+        return outputs
 
     def compute_losses(self, batch, outputs):
         core = source_style_core_losses(
@@ -78,6 +96,9 @@ class WoTEMiningTrainingModule(nn.Module):
         )
         core.pop("matched_anchor")
         raw = dict(core)
+        raw["loss_reward_topk_traj"] = reward_topk_trajectory_loss(
+            outputs, batch["wote_future_poses"].float()
+        )
         raw["loss_current_map"] = current_semantic_map_loss(
             outputs["current_map_logits"],
             batch["wote_current_scene"].float(),
@@ -96,6 +117,7 @@ class WoTEMiningTrainingModule(nn.Module):
         )
         weights = {
             "loss_traj_offset": self.config.wote_traj_offset_loss_weight,
+            "loss_reward_topk_traj": self.config.wote_reward_topk_loss_weight,
             "loss_offset_imitation": self.config.wote_offset_imitation_loss_weight,
             "loss_imitation_reward": self.config.wote_imitation_reward_loss_weight,
             "loss_metric_reward": self.config.wote_metric_reward_loss_weight,
@@ -192,6 +214,35 @@ class WoTEMiningTrainingModule(nn.Module):
                     raise ValueError("future modulation diagnostic has invalid shape")
                 diagnostics[name] = magnitude.mean()
                 diagnostic_weights[name] = future.new_tensor(magnitude.numel())
+        topk_valid = outputs["reward_topk_training_valid"]
+        topk_count = topk_valid.sum(dim=1).float()
+        for name, values in (
+            ("traj_reward_topk_candidates_mean", topk_count),
+            ("traj_reward_topk_eligible_mean", outputs["reward_topk_eligible_count"]),
+            ("traj_reward_selected_supervised_fraction",
+             outputs["reward_topk_selected_supervised"]),
+        ):
+            diagnostics[name] = values.float().mean()
+            diagnostic_weights[name] = future.new_tensor(batch_size)
+        topk_trajectories = outputs["trajectories"].gather(
+            1, outputs["reward_topk_training_indices"][:, :, None, None].expand(
+                -1, -1, 8, 3
+            ),
+        ).float()
+        topk_target = future[:, None].expand_as(topk_trajectories)
+        topk_trajectories = torch.where(
+            topk_valid[:, :, None, None], topk_trajectories, topk_target
+        )
+        topk_distance = torch.linalg.vector_norm(
+            topk_trajectories[..., :2] - topk_target[..., :2], dim=-1
+        )
+        valid_count = topk_valid.sum().to(future)
+        for name, values in (
+            ("traj_reward_topk_ade_m", topk_distance.mean(dim=-1)),
+            ("traj_reward_topk_fde_m", topk_distance[:, :, -1]),
+        ):
+            diagnostics[name] = (values * topk_valid).sum() / valid_count.clamp_min(1)
+            diagnostic_weights[name] = valid_count
         return diagnostics, diagnostic_weights
 
 
@@ -297,6 +348,25 @@ def parse_args():
     parser.add_argument("--use-velocity", action="store_true")
     parser.add_argument("--no-target-point-image", action="store_true")
     parser.add_argument("--future-map-candidates", type=int, default=1)
+    parser.add_argument(
+        "--reward-topk", type=int, default=WoTEMiningConfig.wote_reward_topk,
+        help="maximum extra expert-compatible candidates to supervise (0 disables)",
+    )
+    parser.add_argument(
+        "--reward-topk-loss-weight", type=float,
+        default=WoTEMiningConfig.wote_reward_topk_loss_weight,
+        help="auxiliary Smooth L1 weight on final decoded trajectories (0 disables)",
+    )
+    parser.add_argument(
+        "--reward-topk-ade-max-m", type=float,
+        default=WoTEMiningConfig.wote_reward_topk_ade_max_m,
+        help="maximum mean XY distance to expert for extra candidates, in meters",
+    )
+    parser.add_argument(
+        "--reward-topk-endpoint-max-m", type=float,
+        default=WoTEMiningConfig.wote_reward_topk_endpoint_max_m,
+        help="maximum final XY distance to expert for extra candidates, in meters",
+    )
     parser.add_argument("--grad-clip", type=float, default=5.0)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--resume", default=None)
@@ -498,6 +568,7 @@ def save_checkpoint(path, model, optimizer, scaler, epoch, args, config,
             "loss_weights": {
                 name: getattr(config, name) for name in (
                     "wote_traj_offset_loss_weight",
+                    "wote_reward_topk_loss_weight",
                     "wote_offset_imitation_loss_weight",
                     "wote_imitation_reward_loss_weight",
                     "wote_metric_reward_loss_weight",
@@ -507,8 +578,20 @@ def save_checkpoint(path, model, optimizer, scaler, epoch, args, config,
                     "wote_agent_box_loss_weight",
                 )
             },
+            "reward_topk_supervision": {
+                "topk": config.wote_reward_topk,
+                "ade_max_m": config.wote_reward_topk_ade_max_m,
+                "endpoint_max_m": config.wote_reward_topk_endpoint_max_m,
+            },
         },
     }, path)
+
+
+def reward_topk_supervision_signature(loss_weight, topk, ade_max_m, endpoint_max_m):
+    """Compare loss definitions on resume, treating either off switch alike."""
+    if loss_weight == 0.0 or topk == 0:
+        return None
+    return (float(loss_weight), int(topk), float(ade_max_m), float(endpoint_max_m))
 
 
 def write_tensorboard_epoch(writer, epoch, learning_rate, train_metrics,
@@ -545,6 +628,14 @@ def main():
     args = parse_args()
     if args.save_every < 0:
         raise ValueError("--save-every must be non-negative")
+    if not 0 <= args.reward_topk < WoTEMiningConfig.num_traj_anchors:
+        raise ValueError("--reward-topk must be between 0 and anchor count - 1")
+    if (not math.isfinite(args.reward_topk_loss_weight)
+            or args.reward_topk_loss_weight < 0.0):
+        raise ValueError("--reward-topk-loss-weight must be finite and nonnegative")
+    if any(not math.isfinite(value) or value <= 0.0 for value in (
+            args.reward_topk_ade_max_m, args.reward_topk_endpoint_max_m)):
+        raise ValueError("reward top-k distance thresholds must be finite and positive")
     distributed, rank, local_rank, world_size, device = distributed_context()
     seed_everything(args.seed, rank)
 
@@ -569,6 +660,10 @@ def main():
     config.use_target_point_image = not args.no_target_point_image
     config.n_layer = args.transformer_layers
     config.wote_num_future_map_candidates = args.future_map_candidates
+    config.wote_reward_topk = args.reward_topk
+    config.wote_reward_topk_loss_weight = args.reward_topk_loss_weight
+    config.wote_reward_topk_ade_max_m = args.reward_topk_ade_max_m
+    config.wote_reward_topk_endpoint_max_m = args.reward_topk_endpoint_max_m
     config.wote_lr = args.lr
     config.wote_min_lr = args.min_lr
     config.wote_weight_decay = args.weight_decay
@@ -602,6 +697,23 @@ def main():
             scaler.load_state_dict(checkpoint["scaler"])
         start_epoch = int(checkpoint["epoch"]) + 1
         best_val_loss = float(checkpoint.get("best_val_loss", float("inf")))
+        previous_config = checkpoint.get("config", {})
+        previous_topk = previous_config.get("reward_topk_supervision", {})
+        previous_signature = reward_topk_supervision_signature(
+            previous_config.get("loss_weights", {}).get("wote_reward_topk_loss_weight", 0.0),
+            previous_topk.get("topk", 0), previous_topk.get("ade_max_m", 1.0),
+            previous_topk.get("endpoint_max_m", 2.0),
+        )
+        current_signature = reward_topk_supervision_signature(
+            config.wote_reward_topk_loss_weight, config.wote_reward_topk,
+            config.wote_reward_topk_ade_max_m, config.wote_reward_topk_endpoint_max_m,
+        )
+        if previous_signature != current_signature:
+            # Old and new totals have different definitions. Retain optimizer
+            # state/epoch, but do not compare the new objective to an old best.
+            best_val_loss = float("inf")
+            if rank == 0:
+                print("reward top-k objective changed on resume; reset best_val_loss")
 
     if distributed:
         model = DistributedDataParallel(
@@ -662,6 +774,11 @@ def main():
             print("tensorboard_logdir=%s" % tensorboard_dir)
         print("device=%s world_size=%d train=%d val=%d" % (
             device, world_size, len(train_set), len(val_set)
+        ))
+        print("reward_topk=%d weight=%.3f ADE<=%.2fm FDE<=%.2fm" % (
+            config.wote_reward_topk, config.wote_reward_topk_loss_weight,
+            config.wote_reward_topk_ade_max_m,
+            config.wote_reward_topk_endpoint_max_m,
         ))
 
     for epoch in range(start_epoch, args.epochs):

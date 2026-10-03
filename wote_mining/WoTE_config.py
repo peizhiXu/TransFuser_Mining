@@ -27,6 +27,12 @@ class WoTEMiningConfig(GlobalConfig):
     # Source WoTE training defaults (configs/default.py).
     wote_num_future_map_candidates = 1
     wote_traj_offset_loss_weight = 1.0
+    # Keep the original WTA oracle loss; add at most four compatible,
+    # reward-preferred modes directly on the final AdaLN decoded trajectories.
+    wote_reward_topk_loss_weight = 0.25
+    wote_reward_topk = 4
+    wote_reward_topk_endpoint_max_m = 2.0
+    wote_reward_topk_ade_max_m = 1.0
     wote_offset_imitation_loss_weight = 0.1
     wote_imitation_reward_loss_weight = 1.0
     wote_metric_reward_loss_weight = 1.0
