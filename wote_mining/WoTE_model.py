@@ -691,8 +691,8 @@ class WoTEMiningTrajectoryHead(nn.Module):
             hidden_dim, elementwise_affine=False
         )
         self.future_adaln_modulation = nn.Sequential(
-            nn.LayerNorm(hidden_dim * 2),
-            nn.Linear(hidden_dim * 2, hidden_dim), nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim * 3),
         )
         self.future_update_mlp = nn.Sequential(
@@ -736,11 +736,12 @@ class WoTEMiningTrajectoryHead(nn.Module):
         """Finish the original anchor-offset decode with a future-BEV read.
 
         Each fixed-anchor query attends only to the future BEV predicted for
-        that same anchor.  The query and future read predict feature-wise
-        scale, shift, and a residual gate for an AdaLN-Zero-style update.  The
-        conditioning projection is zero-initialized, making the initial fused
-        feature exactly equal to the current-BEV feature before the existing
-        offset and score heads.
+        that same anchor.  The resulting future feature is the sole explicit
+        condition that predicts feature-wise scale, shift, and a residual gate
+        for an AdaLN-Zero-style update.  The anchor remains the attention query
+        but is not concatenated into the modulation condition.  The condition
+        projection is zero-initialized, making the initial fused feature
+        exactly equal to the current-BEV feature before the existing heads.
         """
         anchors = outputs["anchors"]
         anchor_features = outputs["anchor_features"]
@@ -773,9 +774,7 @@ class WoTEMiningTrajectoryHead(nn.Module):
             )
             future_reads.append(future_read.reshape(batch, chunk, -1))
         future_bev_features = torch.cat(future_reads, dim=1)
-        modulation = self.future_adaln_modulation(torch.cat((
-            anchor_features, future_bev_features,
-        ), dim=-1))
+        modulation = self.future_adaln_modulation(future_bev_features)
         future_scale, future_shift, future_gate = modulation.chunk(3, dim=-1)
         normalized_current = self.current_feature_norm(current_bev_features)
         conditioned_current = (

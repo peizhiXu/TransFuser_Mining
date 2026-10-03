@@ -58,13 +58,17 @@ CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run \
 这里的 `anchor + offset` 就是原版 WoTE 的轨迹生成方式，不是生成轨迹后的修正器。
 实现中没有额外的绝对轨迹头、残差修正器、局部未来 BEV、top-k 或新增轨迹损失。
 当前 BEV 解码特征保留为规划主路径；候选 query 对对应的整张未来 BEV 做一次
-全局注意力读取，并由读取结果产生逐通道 `scale` 和 `shift`：
+全局注意力读取。候选 query 只用于读取，不再直接拼接进调制器；读取到的
+未来 BEV 特征是 AdaLN-Zero 的唯一显式条件，用它产生逐通道 `scale`、`shift`
+和 `gate`：
 
 ```text
-fused = current * (1 + scale) + shift
+conditioned = LayerNorm(current) * (1 + scale) + shift
+future_update = MLP(conditioned)
+fused = current + gate * future_update
 ```
 
-产生 `scale/shift` 的最后一层使用全零初始化，因此训练起点严格满足
+产生 `scale/shift/gate` 的最后一层使用全零初始化，因此训练起点严格满足
 `fused == current`，未来信息随后通过原有轨迹损失逐渐学习影响规划。原来的 WTA
 offset loss、候选 imitation loss、固定 anchor 奖励标签和地图标签都保留。
 
