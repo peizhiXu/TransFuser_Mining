@@ -682,10 +682,17 @@ class WoTEMiningTrajectoryHead(nn.Module):
         self.future_bev_attention = nn.MultiheadAttention(
             hidden_dim, heads, dropout=0.1, batch_first=True
         )
-        self.bev_read_fusion = nn.Sequential(
-            nn.Linear(hidden_dim * 3, hidden_dim), nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
+        # The current-BEV decoder remains the main planning path.  The
+        # candidate-aligned future read predicts an identity-initialized FiLM
+        # modulation, so future information starts with exactly zero effect
+        # and is learned only through the original trajectory objectives.
+        self.future_feature_modulation = nn.Sequential(
+            nn.LayerNorm(hidden_dim * 2),
+            nn.Linear(hidden_dim * 2, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim * 2),
         )
+        nn.init.zeros_(self.future_feature_modulation[-1].weight)
+        nn.init.zeros_(self.future_feature_modulation[-1].bias)
         self.future_candidate_chunk = 16
         self.offset_head = nn.Linear(hidden_dim, 24)
         self.score_head = nn.Linear(hidden_dim, 1)
@@ -720,8 +727,10 @@ class WoTEMiningTrajectoryHead(nn.Module):
         """Finish the original anchor-offset decode with a future-BEV read.
 
         Each fixed-anchor query attends only to the future BEV predicted for
-        that same anchor.  The current-BEV read, future-BEV read, and original
-        query are fused before the existing offset and score heads.
+        that same anchor.  The query and future read predict a feature-wise
+        scale and shift for the current-BEV feature.  Their final projection
+        is zero-initialized, making the initial fused feature exactly equal to
+        the current-BEV feature before the existing offset and score heads.
         """
         anchors = outputs["anchors"]
         anchor_features = outputs["anchor_features"]
@@ -754,9 +763,11 @@ class WoTEMiningTrajectoryHead(nn.Module):
             )
             future_reads.append(future_read.reshape(batch, chunk, -1))
         future_bev_features = torch.cat(future_reads, dim=1)
-        decoded = self.bev_read_fusion(torch.cat((
-            anchor_features, current_bev_features, future_bev_features,
+        modulation = self.future_feature_modulation(torch.cat((
+            anchor_features, future_bev_features,
         ), dim=-1))
+        future_scale, future_shift = modulation.chunk(2, dim=-1)
+        decoded = current_bev_features * (1.0 + future_scale) + future_shift
         offsets = self.offset_head(decoded).reshape_as(anchors)
         return {
             "offsets": offsets,
@@ -764,6 +775,8 @@ class WoTEMiningTrajectoryHead(nn.Module):
             "scores": self.score_head(decoded).squeeze(-1),
             "offset_features": decoded,
             "future_bev_features": future_bev_features,
+            "future_scale_magnitude": future_scale.abs().mean(dim=-1),
+            "future_shift_magnitude": future_shift.abs().mean(dim=-1),
         }
 
     def forward(self, fused_lidar, speed, target_point):
