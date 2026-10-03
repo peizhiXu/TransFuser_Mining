@@ -180,7 +180,12 @@ class WoTEMiningTrainingModule(nn.Module):
             diagnostics[prefix + "_fde_m"] = displacement[:, -1].mean()
             diagnostic_weights[prefix + "_ade_m"] = future.new_tensor(batch_size)
             diagnostic_weights[prefix + "_fde_m"] = future.new_tensor(batch_size)
-        for name in ("future_scale_magnitude", "future_shift_magnitude"):
+        for name in (
+            "future_scale_magnitude",
+            "future_shift_magnitude",
+            "future_gate_magnitude",
+            "future_residual_magnitude",
+        ):
             magnitude = outputs.get(name)
             if magnitude is not None:
                 if magnitude.shape != anchors.shape[:2]:

@@ -44,7 +44,7 @@ CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run \
 世界模型①按每条 anchor 预测未来 BEV                    │
             └── 同一 query 读取对应未来 BEV             │
                               │                         │
-                  零初始化 scale / shift 调制 ──────────┘
+             零初始化 AdaLN-Zero 残差调制 ──────────┘
                               │
                               原 offset_head 输出 offset
                                                │
@@ -99,6 +99,7 @@ sigmoid 形式用于兼容矿山版可相互重叠的语义图层。
 `metrics.jsonl` 除联合 loss 外，还记录五个评价头各自的 `bce`、`mae`、
 `pred_mean`、`target_mean` 和 `valid_fraction`，以及轨迹的
 `traj_matched_{ade,fde}_m`、`traj_selected_{ade,fde}_m`、
-`future_scale_magnitude` 与 `future_shift_magnitude`。后两项表示未来调制的平均绝对
-幅度，只用于观察模型使用未来特征的程度，不能单独证明未来信息带来了收益。这些
+`future_scale_magnitude`、`future_shift_magnitude`、`future_gate_magnitude` 与
+`future_residual_magnitude`。这些项表示 AdaLN-Zero 调制参数及实际残差更新的
+平均绝对幅度，只用于观察模型使用未来特征的程度，不能单独证明未来信息带来了收益。这些
 字段均为无梯度监控量，不参与 `loss_total`，不会改变训练目标。

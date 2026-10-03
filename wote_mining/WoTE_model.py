@@ -683,16 +683,25 @@ class WoTEMiningTrajectoryHead(nn.Module):
             hidden_dim, heads, dropout=0.1, batch_first=True
         )
         # The current-BEV decoder remains the main planning path.  The
-        # candidate-aligned future read predicts an identity-initialized FiLM
-        # modulation, so future information starts with exactly zero effect
-        # and is learned only through the original trajectory objectives.
-        self.future_feature_modulation = nn.Sequential(
+        # candidate-aligned future read conditions a lightweight AdaLN-Zero
+        # residual branch.  Its final conditioning projection is zero-
+        # initialized, so scale, shift, and gate all start at zero and the
+        # fused feature is exactly the unmodified current-BEV feature.
+        self.current_feature_norm = nn.LayerNorm(
+            hidden_dim, elementwise_affine=False
+        )
+        self.future_adaln_modulation = nn.Sequential(
             nn.LayerNorm(hidden_dim * 2),
             nn.Linear(hidden_dim * 2, hidden_dim), nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.Linear(hidden_dim, hidden_dim * 3),
         )
-        nn.init.zeros_(self.future_feature_modulation[-1].weight)
-        nn.init.zeros_(self.future_feature_modulation[-1].bias)
+        self.future_update_mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+        )
+        nn.init.zeros_(self.future_adaln_modulation[-1].weight)
+        nn.init.zeros_(self.future_adaln_modulation[-1].bias)
         self.future_candidate_chunk = 16
         self.offset_head = nn.Linear(hidden_dim, 24)
         self.score_head = nn.Linear(hidden_dim, 1)
@@ -727,10 +736,11 @@ class WoTEMiningTrajectoryHead(nn.Module):
         """Finish the original anchor-offset decode with a future-BEV read.
 
         Each fixed-anchor query attends only to the future BEV predicted for
-        that same anchor.  The query and future read predict a feature-wise
-        scale and shift for the current-BEV feature.  Their final projection
-        is zero-initialized, making the initial fused feature exactly equal to
-        the current-BEV feature before the existing offset and score heads.
+        that same anchor.  The query and future read predict feature-wise
+        scale, shift, and a residual gate for an AdaLN-Zero-style update.  The
+        conditioning projection is zero-initialized, making the initial fused
+        feature exactly equal to the current-BEV feature before the existing
+        offset and score heads.
         """
         anchors = outputs["anchors"]
         anchor_features = outputs["anchor_features"]
@@ -763,11 +773,17 @@ class WoTEMiningTrajectoryHead(nn.Module):
             )
             future_reads.append(future_read.reshape(batch, chunk, -1))
         future_bev_features = torch.cat(future_reads, dim=1)
-        modulation = self.future_feature_modulation(torch.cat((
+        modulation = self.future_adaln_modulation(torch.cat((
             anchor_features, future_bev_features,
         ), dim=-1))
-        future_scale, future_shift = modulation.chunk(2, dim=-1)
-        decoded = current_bev_features * (1.0 + future_scale) + future_shift
+        future_scale, future_shift, future_gate = modulation.chunk(3, dim=-1)
+        normalized_current = self.current_feature_norm(current_bev_features)
+        conditioned_current = (
+            normalized_current * (1.0 + future_scale) + future_shift
+        )
+        future_update = self.future_update_mlp(conditioned_current)
+        gated_future_update = future_gate * future_update
+        decoded = current_bev_features + gated_future_update
         offsets = self.offset_head(decoded).reshape_as(anchors)
         return {
             "offsets": offsets,
@@ -777,6 +793,8 @@ class WoTEMiningTrajectoryHead(nn.Module):
             "future_bev_features": future_bev_features,
             "future_scale_magnitude": future_scale.abs().mean(dim=-1),
             "future_shift_magnitude": future_shift.abs().mean(dim=-1),
+            "future_gate_magnitude": future_gate.abs().mean(dim=-1),
+            "future_residual_magnitude": gated_future_update.abs().mean(dim=-1),
         }
 
     def forward(self, fused_lidar, speed, target_point):
