@@ -285,12 +285,18 @@ class TrainingIntegrationTests(unittest.TestCase):
                     head.future_adaln_modulation[-1].bias[2 * head.offset_head.in_features:].fill_(0.1)
                 outputs = module(batch)
                 future = outputs['future_bev_tokens']
+                future_scene = outputs['future_scene_tokens']
+                current_scene = outputs['current_scene_tokens']
                 self.assertTrue(future.requires_grad)
                 future.retain_grad()
+                future_scene.retain_grad()
+                current_scene.retain_grad()
                 losses = module.compute_losses(batch, outputs)
                 self.assertGreater(losses[loss_name].item(), 0.)
                 losses[loss_name].backward()
                 self.assertIsNone(future.grad)
+                self.assertIsNone(future_scene.grad)
+                self.assertIsNone(current_scene.grad)
                 self.assertTrue(all(parameter.grad is None
                                     for parameter in module.planner.world_model.parameters()))
                 for layer in (head.offset_head, head.future_adaln_modulation[-1],
@@ -388,7 +394,10 @@ class AdaLNGradientTests(unittest.TestCase):
                 head.future_adaln_modulation[-1].bias[64:].fill_(0.1)
             current = head(torch.randn(1, 512, 8, 8), torch.ones(1, 1), torch.ones(1, 2))
             future = torch.randn(1, 256, 64, 32, requires_grad=True)
-            current.update(head.fuse_future_bev(current, future))
+            current_scene = torch.randn(1, 64, 32, requires_grad=True)
+            current.update(head.fuse_future_bev(
+                current, future, current_scene
+            ))
             rewards = torch.arange(256)[None].float().requires_grad_()
             expert = torch.zeros(1, 8, 3)
             current.update(select_reward_topk_training_candidates(
@@ -401,9 +410,31 @@ class AdaLNGradientTests(unittest.TestCase):
                 self.assertGreater(layer.weight.grad.abs().sum().item(), 0.)
             self.assertGreater(head.future_bev_attention.in_proj_weight.grad.abs().sum().item(), 0.)
             self.assertIsNone(future.grad)
+            self.assertIsNone(current_scene.grad)
             self.assertIsNone(rewards.grad)
         finally:
             torch.set_num_threads(previous_threads)
+
+    def test_identical_aligned_scenes_have_zero_temporal_residual(self):
+        from wote_mining.WoTE_model import WoTEMiningTrajectoryHead
+        anchors = np.zeros((8, 8, 3), dtype=np.float32)
+        with patch('wote_mining.WoTE_model.np.load', return_value=anchors):
+            head = WoTEMiningTrajectoryHead(
+                'synthetic.npy', hidden_dim=32, layers=1, heads=4
+            )
+        head.eval()
+        current = head(
+            torch.randn(1, 512, 8, 8), torch.ones(1, 1), torch.ones(1, 2)
+        )
+        scene = torch.randn(1, 64, 32)
+        fused = head.fuse_future_bev(
+            current, scene[:, None].expand(-1, 8, -1, -1), scene
+        )
+        self.assertTrue(torch.equal(
+            fused['future_delta_magnitude'], torch.zeros(1, 8)
+        ))
+        # AdaLN-Zero still preserves the original decoder at initialization.
+        self.assertTrue(torch.equal(fused['offset_features'], current['offset_features']))
 
 
 if __name__ == '__main__':

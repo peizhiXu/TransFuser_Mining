@@ -42,8 +42,10 @@ CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run \
             │
             ├── cross-attention 读取当前 BEV ───────────┐
             │                                           │
-世界模型①按每条 anchor 预测未来 BEV                    │
-            └── 同一 query 读取对应未来 BEV             │
+世界模型①按每条 anchor 预测未来 scene                   │
+            └── 注入动作前的未来 scene - 对齐当前 scene  │
+                              │                         │
+                 同一 query 读取对应变化量              │
                               │                         │
              零初始化 AdaLN-Zero 残差调制 ──────────┘
                               │
@@ -58,10 +60,12 @@ CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run \
 
 这里的 `anchor + offset` 就是原版 WoTE 的轨迹生成方式，不是生成轨迹后的修正器。
 实现中没有额外的绝对轨迹头、残差修正器或局部未来 BEV。
-当前 BEV 解码特征保留为规划主路径；候选 query 对对应的整张未来 BEV 做一次
-全局注意力读取。候选 query 只用于读取，不再直接拼接进调制器；读取到的
-未来 BEV 特征是 AdaLN-Zero 的唯一显式条件，用它产生逐通道 `scale`、`shift`
-和 `gate`：
+当前 BEV 解码特征保留为规划主路径。世界模型先输出动作条件的未来 scene，
+再把动作特征显式注入候选终点格；规划融合只使用**注入前**的未来 scene，
+避免候选 query 从终点格直接读回自己的动作编码。当前与未来 scene 经过同一个
+LayerNorm 后相减，不增加独立投影网络；候选 query 对对应的64个变化 token 做
+一次全局注意力读取。读出的变化特征是 AdaLN-Zero 的唯一显式条件，用它产生
+逐通道 `scale`、`shift` 和 `gate`：
 
 ```text
 conditioned = LayerNorm(current) * (1 + scale) + shift
@@ -77,11 +81,12 @@ offset loss、候选 imitation loss、固定 anchor 奖励标签和地图标签�
 和地图监督仍使用固定 anchors；融合后的 offset/scores 直接接受原版轨迹损失。
 CARLA 在线推理时，融合后生成的完整轨迹再进入世界模型②，最后只计算一次奖励。
 
-送入未来注意力/AdaLN 的未来 BEV 使用 `detach()`，数值不变，但原 WTA 和
-reward-topk 轨迹损失不会沿这条条件路径回传到世界模型。未来注意力、AdaLN、
-offset head 和当前特征路径仍接受轨迹梯度；世界模型原始的未来 tokens 不被
-截断，仍通过原有语义地图与 reward 损失训练。这不是冻结世界模型或共享骨干，
-也没有增加融合前轨迹的辅助监督。模型参数结构和相同权重下的推理数值不变。
+用于构造变化条件的当前与未来 scene 都使用 `detach()`，因此原 WTA 和
+reward-topk 轨迹损失不会沿这条条件路径回传到世界模型或骨干。未来注意力、
+AdaLN、offset head 和当前 BEV 主路径仍接受轨迹梯度；动作注入后的未来 tokens
+继续通过原有语义地图与 reward 损失训练。这不是冻结世界模型或共享骨干，
+也没有增加融合前轨迹的辅助监督。模型参数结构不变，但融合语义已经改变，
+应使用新的输出目录从头训练并单独评估。
 
 ### Reward-topk 多候选轨迹监督（仅训练/验证）
 
@@ -167,7 +172,9 @@ sigmoid 形式用于兼容矿山版可相互重叠的语义图层。
 `metrics.jsonl` 除联合 loss 外，还记录五个评价头各自的 `bce`、`mae`、
 `pred_mean`、`target_mean` 和 `valid_fraction`，以及轨迹的
 `traj_matched_{ade,fde}_m`、`traj_selected_{ade,fde}_m`、
-`future_scale_magnitude`、`future_shift_magnitude`、`future_gate_magnitude` 与
+`future_delta_magnitude`、`future_scale_magnitude`、`future_shift_magnitude`、`future_gate_magnitude` 与
 `future_residual_magnitude`。这些项表示 AdaLN-Zero 调制参数及实际残差更新的
-平均绝对幅度，只用于观察模型使用未来特征的程度，不能单独证明未来信息带来了收益。这些
+平均绝对幅度；其中 `future_delta_magnitude` 是动作终点注入前的未来场景与
+空间对齐当前场景经过共享归一化后的差值幅度。它们只用于观察模型使用未来变化
+特征的程度，不能单独证明未来信息带来了收益。这些
 字段均为无梯度监控量，不参与 `loss_total`，不会改变训练目标。

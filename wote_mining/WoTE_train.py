@@ -203,6 +203,7 @@ class WoTEMiningTrainingModule(nn.Module):
             diagnostic_weights[prefix + "_ade_m"] = future.new_tensor(batch_size)
             diagnostic_weights[prefix + "_fde_m"] = future.new_tensor(batch_size)
         for name in (
+            "future_delta_magnitude",
             "future_scale_magnitude",
             "future_shift_magnitude",
             "future_gate_magnitude",

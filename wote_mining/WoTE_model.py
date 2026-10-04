@@ -200,7 +200,14 @@ class WoTEMiningWorldModel(nn.Module):
                 augmentation_degrees, dtype=bev_tokens.dtype, device=bev_tokens.device
             ).reshape(batch)
         future_scene_chunks = []
+        future_bev_chunks = []
         future_action_chunks = []
+        # This is the current scene in exactly the same spatial/token frame
+        # that enters the transition transformer.  Keeping the positional
+        # encoding here makes it a valid reference for temporal residuals.
+        current_scene_tokens = (
+            bev_tokens + self.scene_position.weight[1:].unsqueeze(0)
+        )
         for start in range(0, selected_count, self.candidate_chunk):
             stop = min(start + self.candidate_chunk, selected_count)
             chunk = stop - start
@@ -217,14 +224,26 @@ class WoTEMiningWorldModel(nn.Module):
                 tokens, mask=self.transition_attention_mask
             )
             future_action = future[:, 0]
+            # Preserve the action-conditioned scene before the explicit
+            # endpoint injection.  Planning reads this representation so it
+            # cannot trivially recover its own action feature from one cell.
+            future_scene_pre_injection = future[:, 1:]
             future_scene = inject_trajectory_feature(
-                future[:, 1:], future_action, traj[:, :, -1, :2].reshape(-1, 2),
+                future_scene_pre_injection, future_action,
+                traj[:, :, -1, :2].reshape(-1, 2),
                 self.lidar_x, degrees[:, None].expand(-1, chunk).reshape(-1),
             )
-            future_scene_chunks.append(future_scene.reshape(batch, chunk, 64, channels))
+            future_scene_chunks.append(
+                future_scene_pre_injection.reshape(batch, chunk, 64, channels)
+            )
+            future_bev_chunks.append(
+                future_scene.reshape(batch, chunk, 64, channels)
+            )
             future_action_chunks.append(future_action.reshape(batch, chunk, channels))
         result = {
-            "future_bev_tokens": torch.cat(future_scene_chunks, dim=1),
+            "current_scene_tokens": current_scene_tokens,
+            "future_scene_tokens": torch.cat(future_scene_chunks, dim=1),
+            "future_bev_tokens": torch.cat(future_bev_chunks, dim=1),
             "future_action_features": torch.cat(future_action_chunks, dim=1),
             "world_trajectories": trajectories,
         }
@@ -678,6 +697,8 @@ class WoTEMiningTrajectoryHead(nn.Module):
         # is the second BEV input of the original trajectory decoder, not a
         # post-hoc trajectory refiner.
         self.future_query_norm = nn.LayerNorm(hidden_dim)
+        # One shared normalization is applied to both temporally aligned
+        # scenes before subtraction.  No separate learned projectors are used.
         self.future_bev_norm = nn.LayerNorm(hidden_dim)
         self.future_bev_attention = nn.MultiheadAttention(
             hidden_dim, heads, dropout=0.1, batch_first=True
@@ -732,19 +753,16 @@ class WoTEMiningTrajectoryHead(nn.Module):
             torch.cat((trajectory_features, status_feature), dim=-1)
         )
 
-    def fuse_future_bev(self, outputs, future_bev_tokens):
-        """Finish the original anchor-offset decode with a future-BEV read.
+    def fuse_future_bev(self, outputs, future_scene_tokens,
+                        current_scene_tokens):
+        """Decode offsets after reading candidate-conditioned scene changes.
 
-        Each fixed-anchor query attends only to the future BEV predicted for
-        that same anchor.  The resulting future feature is the sole explicit
-        condition that predicts feature-wise scale, shift, and a residual gate
-        for an AdaLN-Zero-style update.  The anchor remains the attention query
-        but is not concatenated into the modulation condition.  The condition
-        projection is zero-initialized, making the initial fused feature
-        exactly equal to the current-BEV feature before the existing heads.
-        Future BEV is a detached condition here: trajectory losses train its
-        reader and modulation, while world-model map/reward losses keep their
-        original differentiable future tokens.
+        Each fixed-anchor query attends to the difference between its own
+        pre-injection future scene and the aligned current scene.  A shared
+        LayerNorm keeps both operands in one feature space without adding
+        redundant projectors.  Both scene operands are detached conditions:
+        trajectory losses train the reader and modulation, while world-model
+        map/reward losses retain their original differentiable path.
         """
         anchors = outputs["anchors"]
         anchor_features = outputs["anchor_features"]
@@ -757,14 +775,22 @@ class WoTEMiningTrajectoryHead(nn.Module):
             raise ValueError("anchor_features must have shape [B,K,C]")
         if current_bev_features.shape != expected_features:
             raise ValueError("offset_features must have shape [B,K,C]")
-        if future_bev_tokens.shape != (
+        if future_scene_tokens.shape != (
             batch, count, BEV_SIDE ** 2, self.offset_head.in_features
         ):
-            raise ValueError("future_bev_tokens must have shape [B,K,64,C]")
+            raise ValueError("future_scene_tokens must have shape [B,K,64,C]")
+        if current_scene_tokens.shape != (
+            batch, BEV_SIDE ** 2, self.offset_head.in_features
+        ):
+            raise ValueError("current_scene_tokens must have shape [B,64,C]")
 
-        # Stop only the trajectory-to-world gradient through this condition.
-        # Do not detach anchor_world itself: map/reward supervision needs it.
-        future_bev_tokens = future_bev_tokens.detach()
+        # The main current-BEV decoder remains differentiable.  Only the two
+        # operands used to construct the temporal condition are detached.
+        normalized_future = self.future_bev_norm(future_scene_tokens.detach())
+        normalized_current = self.future_bev_norm(
+            current_scene_tokens.detach()
+        ).unsqueeze(1)
+        future_delta_tokens = normalized_future - normalized_current
         future_reads = []
         for start in range(0, count, self.future_candidate_chunk):
             stop = min(start + self.future_candidate_chunk, count)
@@ -772,15 +798,15 @@ class WoTEMiningTrajectoryHead(nn.Module):
             query = self.future_query_norm(
                 anchor_features[:, start:stop]
             ).reshape(batch * chunk, 1, -1)
-            memory = self.future_bev_norm(
-                future_bev_tokens[:, start:stop]
-            ).reshape(batch * chunk, BEV_SIDE ** 2, -1)
+            memory = future_delta_tokens[:, start:stop].reshape(
+                batch * chunk, BEV_SIDE ** 2, -1
+            )
             future_read, _ = self.future_bev_attention(
                 query, memory, memory, need_weights=False
             )
             future_reads.append(future_read.reshape(batch, chunk, -1))
-        future_bev_features = torch.cat(future_reads, dim=1)
-        modulation = self.future_adaln_modulation(future_bev_features)
+        future_delta_features = torch.cat(future_reads, dim=1)
+        modulation = self.future_adaln_modulation(future_delta_features)
         future_scale, future_shift, future_gate = modulation.chunk(3, dim=-1)
         normalized_current = self.current_feature_norm(current_bev_features)
         conditioned_current = (
@@ -795,7 +821,10 @@ class WoTEMiningTrajectoryHead(nn.Module):
             "trajectories": anchors + offsets,
             "scores": self.score_head(decoded).squeeze(-1),
             "offset_features": decoded,
-            "future_bev_features": future_bev_features,
+            "future_delta_features": future_delta_features,
+            "future_delta_magnitude": future_delta_tokens.abs().mean(
+                dim=(-1, -2)
+            ),
             "future_scale_magnitude": future_scale.abs().mean(dim=-1),
             "future_shift_magnitude": future_shift.abs().mean(dim=-1),
             "future_gate_magnitude": future_gate.abs().mean(dim=-1),
@@ -909,7 +938,8 @@ class WoTEMiningPlanner(nn.Module):
             predict_future_map=False,
         )
         result.update(self.trajectory_head.fuse_future_bev(
-            result, anchor_world["future_bev_tokens"]
+            result, anchor_world["future_scene_tokens"],
+            anchor_world["current_scene_tokens"],
         ))
 
         if use_fused_world:
