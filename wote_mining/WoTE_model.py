@@ -825,6 +825,11 @@ class WoTEMiningTrajectoryHead(nn.Module):
             "future_delta_magnitude": future_delta_tokens.abs().mean(
                 dim=(-1, -2)
             ),
+            # Population spread across all candidates.  This distinguishes a
+            # shared temporal change from genuinely candidate-specific ones.
+            "future_delta_candidate_std": future_delta_tokens.std(
+                dim=1, unbiased=False
+            ).mean(dim=(-1, -2)),
             "future_scale_magnitude": future_scale.abs().mean(dim=-1),
             "future_shift_magnitude": future_shift.abs().mean(dim=-1),
             "future_gate_magnitude": future_gate.abs().mean(dim=-1),

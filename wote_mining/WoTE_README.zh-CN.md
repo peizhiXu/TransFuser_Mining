@@ -172,9 +172,11 @@ sigmoid 形式用于兼容矿山版可相互重叠的语义图层。
 `metrics.jsonl` 除联合 loss 外，还记录五个评价头各自的 `bce`、`mae`、
 `pred_mean`、`target_mean` 和 `valid_fraction`，以及轨迹的
 `traj_matched_{ade,fde}_m`、`traj_selected_{ade,fde}_m`、
-`future_delta_magnitude`、`future_scale_magnitude`、`future_shift_magnitude`、`future_gate_magnitude` 与
+`future_delta_magnitude`、`future_delta_candidate_std`、`future_scale_magnitude`、
+`future_shift_magnitude`、`future_gate_magnitude` 与
 `future_residual_magnitude`。这些项表示 AdaLN-Zero 调制参数及实际残差更新的
 平均绝对幅度；其中 `future_delta_magnitude` 是动作终点注入前的未来场景与
-空间对齐当前场景经过共享归一化后的差值幅度。它们只用于观察模型使用未来变化
-特征的程度，不能单独证明未来信息带来了收益。这些
+空间对齐当前场景经过共享归一化后的差值幅度，`future_delta_candidate_std`
+是这份差值在全部候选之间的总体标准差。两者结合用于区分共享时间变化和候选相关
+变化，但不能单独证明未来信息带来了收益。这些
 字段均为无梯度监控量，不参与 `loss_total`，不会改变训练目标。

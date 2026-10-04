@@ -433,6 +433,8 @@ class AdaLNGradientTests(unittest.TestCase):
         self.assertTrue(torch.equal(
             fused['future_delta_magnitude'], torch.zeros(1, 8)
         ))
+        self.assertEqual(fused['future_delta_candidate_std'].shape, (1,))
+        self.assertEqual(fused['future_delta_candidate_std'].item(), 0.)
         # AdaLN-Zero still preserves the original decoder at initialization.
         self.assertTrue(torch.equal(fused['offset_features'], current['offset_features']))
 

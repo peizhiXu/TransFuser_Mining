@@ -215,6 +215,16 @@ class WoTEMiningTrainingModule(nn.Module):
                     raise ValueError("future modulation diagnostic has invalid shape")
                 diagnostics[name] = magnitude.mean()
                 diagnostic_weights[name] = future.new_tensor(magnitude.numel())
+        candidate_std = outputs.get("future_delta_candidate_std")
+        if candidate_std is not None:
+            if candidate_std.shape != (batch_size,):
+                raise ValueError(
+                    "future candidate delta diagnostic has invalid shape"
+                )
+            diagnostics["future_delta_candidate_std"] = candidate_std.mean()
+            diagnostic_weights["future_delta_candidate_std"] = future.new_tensor(
+                candidate_std.numel()
+            )
         topk_valid = outputs["reward_topk_training_valid"]
         topk_count = topk_valid.sum(dim=1).float()
         for name, values in (
