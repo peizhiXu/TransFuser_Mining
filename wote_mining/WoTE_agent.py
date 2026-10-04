@@ -16,6 +16,7 @@ from torch import nn
 
 from team_code_transfuser.transfuser import TransfuserBackbone
 from wote_mining.WoTE_model import METRIC_NAMES, WoTEMiningPlanner
+from wote_mining.WoTE_diagnostics import reward_topk_diagnostics
 
 
 class PIDController(object):
@@ -285,6 +286,7 @@ class WoTEMiningInferenceModel(nn.Module):
                 float(value) for value in selected_metrics[0].detach().cpu()
             ],
         }
+        self.last_diagnostics.update(reward_topk_diagnostics(outputs))
         self.debug_step += 1
         if (kwargs.get("debug", False) and kwargs.get("save_path") is not None
                 and self.debug_step % 2 == 0):

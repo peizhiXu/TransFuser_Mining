@@ -742,6 +742,9 @@ class WoTEMiningTrajectoryHead(nn.Module):
         but is not concatenated into the modulation condition.  The condition
         projection is zero-initialized, making the initial fused feature
         exactly equal to the current-BEV feature before the existing heads.
+        Future BEV is a detached condition here: trajectory losses train its
+        reader and modulation, while world-model map/reward losses keep their
+        original differentiable future tokens.
         """
         anchors = outputs["anchors"]
         anchor_features = outputs["anchor_features"]
@@ -759,6 +762,9 @@ class WoTEMiningTrajectoryHead(nn.Module):
         ):
             raise ValueError("future_bev_tokens must have shape [B,K,64,C]")
 
+        # Stop only the trajectory-to-world gradient through this condition.
+        # Do not detach anchor_world itself: map/reward supervision needs it.
+        future_bev_tokens = future_bev_tokens.detach()
         future_reads = []
         for start in range(0, count, self.future_candidate_chunk):
             stop = min(start + self.future_candidate_chunk, count)

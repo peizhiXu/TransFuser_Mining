@@ -271,6 +271,47 @@ class TrainingIntegrationTests(unittest.TestCase):
         self.assertEqual(online['trajectories'].shape, (1, 8, 8, 3))
         self.assertTrue(torch.equal(online['world_trajectories'], online['trajectories']))
 
+    def test_trajectory_losses_stop_at_future_condition_but_train_fusion(self):
+        for loss_name in ('loss_traj_offset', 'loss_reward_topk_traj'):
+            with self.subTest(loss=loss_name):
+                torch.manual_seed(7)
+                module, batch = self.make_training_module()
+                module.eval()
+                head = module.planner.trajectory_head
+                with torch.no_grad():
+                    # Test after the zero-initialized gate has started learning.
+                    head.offset_head.weight.normal_(0., 0.005)
+                    head.future_adaln_modulation[-1].weight.normal_(0., 0.01)
+                    head.future_adaln_modulation[-1].bias[2 * head.offset_head.in_features:].fill_(0.1)
+                outputs = module(batch)
+                future = outputs['future_bev_tokens']
+                self.assertTrue(future.requires_grad)
+                future.retain_grad()
+                losses = module.compute_losses(batch, outputs)
+                self.assertGreater(losses[loss_name].item(), 0.)
+                losses[loss_name].backward()
+                self.assertIsNone(future.grad)
+                self.assertTrue(all(parameter.grad is None
+                                    for parameter in module.planner.world_model.parameters()))
+                for layer in (head.offset_head, head.future_adaln_modulation[-1],
+                              head.future_update_mlp[-1], module.planner.backbone.projection):
+                    self.assertGreater(layer.weight.grad.abs().sum().item(), 0.)
+                self.assertGreater(head.future_bev_attention.in_proj_weight.grad.abs().sum().item(), 0.)
+
+    def test_map_and_reward_losses_still_train_world_model(self):
+        for loss_name in ('loss_future_map', 'loss_imitation_reward', 'loss_metric_reward'):
+            with self.subTest(loss=loss_name):
+                torch.manual_seed(7)
+                module, batch = self.make_training_module()
+                module.eval()
+                outputs = module(batch)
+                future = outputs['future_bev_tokens']
+                future.retain_grad()
+                module.compute_losses(batch, outputs)[loss_name].backward()
+                self.assertGreater(future.grad.abs().sum().item(), 0.)
+                gradient = module.planner.world_model.action_encoder[0].weight.grad
+                self.assertGreater(gradient.abs().sum().item(), 0.)
+
     def test_checkpoint_records_settings_without_adding_model_parameters(self):
         from wote_mining.WoTE_train import save_checkpoint
         module, _ = self.make_training_module()
@@ -359,7 +400,7 @@ class AdaLNGradientTests(unittest.TestCase):
                           head.future_update_mlp[-1]):
                 self.assertGreater(layer.weight.grad.abs().sum().item(), 0.)
             self.assertGreater(head.future_bev_attention.in_proj_weight.grad.abs().sum().item(), 0.)
-            self.assertGreater(future.grad.abs().sum().item(), 0.)
+            self.assertIsNone(future.grad)
             self.assertIsNone(rewards.grad)
         finally:
             torch.set_num_threads(previous_threads)
