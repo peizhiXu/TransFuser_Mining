@@ -35,7 +35,8 @@ CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run \
 ## 当前/未来 BEV 融合
 
 本分支在原版 WoTE 的轨迹解码位置加入未来 BEV，候选与 `anchor + offset`
-轨迹表示不变。当前版本保留原有损失，并新增轻量的 reward-topk 多候选轨迹监督：
+轨迹表示不变。当前版本保留原有损失及 reward-topk 多候选轨迹监督，
+并增加稳定未来条件和轻量的未来读取监督：
 
 ```text
 固定 anchors / 原候选 queries
@@ -85,8 +86,56 @@ CARLA 在线推理时，融合后生成的完整轨迹再进入世界模型②�
 reward-topk 轨迹损失不会沿这条条件路径回传到世界模型或骨干。未来注意力、
 AdaLN、offset head 和当前 BEV 主路径仍接受轨迹梯度；动作注入后的未来 tokens
 继续通过原有语义地图与 reward 损失训练。这不是冻结世界模型或共享骨干，
-也没有增加融合前轨迹的辅助监督。模型参数结构不变，但融合语义已经改变，
-应使用新的输出目录从头训练并单独评估。
+也没有增加融合前轨迹的辅助监督。当前版本新增一个读取评价头，
+应使用新的输出目录从头训练并单独评估，不直接续训旧 checkpoint。
+
+### 稳定未来条件与读取监督
+
+训练时，原世界模型①的计算和 dropout 不变，继续接受语义地图、reward 损失。
+仅对规划用的未来条件额外进行一次 `no_grad` 前向：临时关闭动作编码器
+`anchor_context` 和世界模型 `transition` 的 dropout，重新编码固定 anchors，
+获得动作注入前的未来 scene。之后恢复所有子模块原来的训练状态。
+这样消除这两处 dropout 给候选条件引入的独立随机差异；不是把整个模型设为
+eval，也不冻结世界模型。共享骨干、规划 query 和读取注意力仍按原方式训练，
+因此不能要求训练/验证集的所有诊断值完全相同。验证和在线推理已经处于 eval，
+直接复用已有世界模型①的输出，不增加世界模型调用。
+
+在 `future_delta_features`（注意力读出的特征，进入 AdaLN 之前）上增加一个
+`Linear(256,3)` 头，预测 **NC / DAC / EP**。监督直接使用现有
+`wote_metric_targets[..., :3]` 和有效标签掩码，不使用 reward 预测当伪标签，
+也不重建标签。未来条件基于固定 anchor，标签使用相同候选 ID，不能把它解释成
+融合后新轨迹的安全真值。每项 BCE 独立按有效标签平均，三项相加，
+默认总权重 **0.1**。没有有效标签时贡献连接计算图的零损失。
+
+这项损失训练读取注意力、共享归一化、query 路径和新增读取头；由于 scene
+操作数仍 detach，不沿条件路径训练世界模型。辅助头不直接训练 AdaLN，
+AdaLN 仍由原轨迹损失和 reward-topk 轨迹损失训练。
+它不是新的在线 reward head；在线关闭辅助头计算，仍由原五指标 reward
+选出轨迹，PID 不变。它能促使读取结果包含候选相关信息，但不保证消除候选相似
+或提升闭环表现，也不能单凭 BCE 降低证明世界预测正确。
+
+新增头有 **771** 个参数，旧 checkpoint 缺少该头，无法在本版直接严格加载或
+恢复优化器状态；旧模型闭环测试请继续使用对应旧项目代码。新版本自身的 checkpoint
+支持正常 `--resume`；若改变读取权重、稳定条件或 top-k 设置，重置历史最优总损失。
+
+默认开启，无需新增训练参数；如需显式指定：
+
+```bash
+--future-read-loss-weight 0.1
+```
+
+`--future-read-loss-weight 0` 仅关闭新增损失，不关闭稳定条件；
+`--no-stable-future-condition` 仅取消额外确定性条件前向。训练增加一次不保存反向图的
+世界模型①前向，会有额外计算成本；验证和闭环推理不增加世界模型次数。
+
+TensorBoard 新增 `loss_future_read_metrics`（已乘权重）、
+`future_read_{no_collision,drivable_compliance,ego_progress}_{bce,mae,pred_mean,target_mean,valid_fraction}`、
+`future_read_no_collision_unsafe_{mae,fraction}`。NC 多数标签可能为“安全”，
+应同时看不安全样本比例与误差，不能只看总体 BCE。
+`future_scene_candidate_std` 衡量实际规划条件中的原始未来 scene 的候选差异，
+`future_delta_candidate_std` 衡量归一化差值的候选差异，
+`future_read_candidate_std` 衡量最终读取特征的候选差异。前两者来自稳定条件；
+后一项仍可能包含训练态 query/attention dropout，不是纯环境差异。
 
 ### Reward-topk 多候选轨迹监督（仅训练/验证）
 
@@ -117,10 +166,11 @@ AdaLN、offset head 和当前 BEV 主路径仍接受轨迹梯度；动作注入�
 --reward-topk-endpoint-max-m 2.0
 ```
 
-`--reward-topk 0` 或 `--reward-topk-loss-weight 0` 会关闭辅助监督，恢复之前的
-训练总损失。建议本版本使用新的输出目录重新训练，避免混合旧日志；模型参数结构
-没有变化，旧 AdaLN checkpoint 仍可严格加载。设置同时写入 `args.json` 和 checkpoint。
-若用 `--resume` 加载旧 checkpoint 或改变辅助监督设置，会重置最低验证损失记录，
+`--reward-topk 0` 或 `--reward-topk-loss-weight 0` 会将辅助 top-k 项置零；
+新增的读取监督独立控制。建议本版本使用新的输出目录重新训练，
+避免混合旧日志。top-k 本身不改变参数结构，但本次读取头改变了结构，
+旧 AdaLN checkpoint 不再直接兼容。设置同时写入 `args.json` 和 checkpoint。
+若用 `--resume` 加载本版 checkpoint 并改变辅助监督设置，会重置最低验证损失记录，
 避免用新总损失与旧训练目标下的数值比较；模型、优化器状态和 epoch 仍正常恢复。
 
 新增 TensorBoard 指标：`loss_reward_topk_traj`（已经乘以辅助权重）、

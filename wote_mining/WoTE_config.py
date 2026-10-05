@@ -33,6 +33,10 @@ class WoTEMiningConfig(GlobalConfig):
     wote_reward_topk = 4
     wote_reward_topk_endpoint_max_m = 2.0
     wote_reward_topk_ade_max_m = 1.0
+    # A separate no-grad, dropout-free World1 condition during training.
+    # Map/reward learning retains the original stochastic world-model pass.
+    wote_stable_future_condition = True
+    wote_future_read_loss_weight = 0.1
     wote_offset_imitation_loss_weight = 0.1
     wote_imitation_reward_loss_weight = 1.0
     wote_metric_reward_loss_weight = 1.0

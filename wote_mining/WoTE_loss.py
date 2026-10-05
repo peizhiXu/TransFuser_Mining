@@ -106,6 +106,37 @@ def reward_topk_trajectory_loss(outputs, future_poses):
             / weights.sum(dim=1).clamp_min(1.0)).mean()
 
 
+def future_read_metric_loss(logits, metric_targets, metric_valid):
+    """Teach the detached-future reader NC/DAC/EP using fixed-anchor labels.
+
+    Each metric is averaged over its own valid entries, then the three are
+    summed. Missing labels contribute a graph-connected zero for DDP. This
+    is not a second reward used to select trajectories during inference.
+    """
+    if logits.ndim != 3 or logits.shape[-1] != 3:
+        raise ValueError("future read logits must have shape [B,K,3]")
+    if (metric_targets.shape != logits.shape[:2] + (5,)
+            or metric_valid.shape != metric_targets.shape):
+        raise ValueError("future read targets/validity must have shape [B,K,5]")
+    logits = logits.float()
+    target = metric_targets[..., :3].to(logits)
+    valid = metric_valid[..., :3].to(logits)
+    if not torch.isfinite(valid).all() or ((valid < 0) | (valid > 1)).any():
+        raise ValueError("future read validity must be finite values in [0,1]")
+    active = valid > 0
+    if (not torch.isfinite(target[active]).all()
+            or ((target[active] < 0) | (target[active] > 1)).any()):
+        raise ValueError("valid future read targets must be finite values in [0,1]")
+    # Mask before BCE, so missing targets/predictions cannot introduce NaNs.
+    target = torch.where(active, target, torch.zeros_like(target))
+    safe_logits = torch.where(active, logits, torch.zeros_like(logits))
+    elementwise = F.binary_cross_entropy_with_logits(
+        safe_logits, target, reduction="none"
+    )
+    return ((elementwise * valid).sum(dim=(0, 1))
+            / valid.sum(dim=(0, 1)).clamp_min(1.0)).sum()
+
+
 def source_style_core_losses(outputs, future_poses, metric_targets=None,
                              metric_valid=None):
     """WTA offset + soft imitation objectives, optionally five metric heads.
