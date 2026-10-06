@@ -7,6 +7,7 @@ wote_mining/
 ├── WoTE_model.py                           完整核心模型
 ├── WoTE_loss.py                            联合损失
 ├── WoTE_train.py                           训练逻辑与入口
+├── WoTE_inference_eval.py                  录制验证集上的推理路径诊断
 ├── WoTE_agent.py                           推理、控制与CARLA Agent
 ├── WoTE_config.py                          矿山配置
 ├── WoTE_targets.py                         训练目标构造
@@ -230,3 +231,55 @@ sigmoid 形式用于兼容矿山版可相互重叠的语义图层。
 是这份差值在全部候选之间的总体标准差。两者结合用于区分共享时间变化和候选相关
 变化，但不能单独证明未来信息带来了收益。这些
 字段均为无梯度监控量，不参与 `loss_total`，不会改变训练目标。
+
+## 录制验证集上的推理路径诊断（不需要重训）
+
+训练及原有 loss 验证保留固定 anchor 评分方式，不改训练目标。新增独立入口
+`WoTE_inference_eval.py`，对同一帧进行两次 **eval/no_grad** 前向：
+
+- `proxy`：`use_fused_world=False`，按固定 anchor 的 reward 选择 ID，再提取该
+  ID 的 **融合后轨迹**；对应原 TensorBoard 的选中轨迹误差统计。
+- `online`：`use_fused_world=True`，完整融合后轨迹重新编码，进入世界模型②、
+  原 reward head，选择最终 reward 最大的轨迹。调用路径与 CARLA agent 一致，
+  但传感器输入仍是录制验证数据，没有运行 CARLA/PID。
+- `oracle_min_ade`：最终候选库中 ADE 最低的一条，仅用于诊断，不参与执行。
+
+比较两者的 ADE/FDE、选择 ID 一致率、首秒位置误差，以及按 PID 同一公式计算的
+原始目标速度误差（前两个点间距乘2）、该段速度向量和方向误差。方向误差仅统计
+预测和专家速度都大于0.1m/s的样本，单独保存有效数；停止样本仍统计位置和速度。
+`online_selection_regret_ade_m` 是实际选中轨迹 ADE 减去候选最小 ADE；
+`online_reward_top4_min_ade_m` 检查更接近专家的轨迹是否进入 reward 前4名。
+最小 FDE 和 ADE 最小那条轨迹的 FDE 分别记录，避免混为一条“最优轨迹”。
+
+在训练服务器同时比较旧残差与 stable-read 的 epoch30：
+
+```bash
+conda activate WoTE
+cd /home/kemove/xpz/projects/transfuser_wote_bevfusion_residual
+
+CUDA_VISIBLE_DEVICES=0 python wote_mining/WoTE_inference_eval.py \
+  --root-dir /home/kemove/xpz/datasets/mining_dataset_hd465/split_v2 \
+  --checkpoint previous=/home/kemove/xpz/outputs/wote/wote-bevfusion-residual-adalnzero-topk-bs16-30ep/checkpoint_030.pth \
+  --checkpoint stable_read=/home/kemove/xpz/outputs/wote/wote-bevfusion-residual-stableread-bs16-30ep/checkpoint_030.pth \
+  --output-dir /home/kemove/xpz/outputs/wote/inference-compare-residual-stableread-ep30 \
+  --batch-size 4 --workers 4
+```
+
+如需先检查读数据及权重，可另选输出目录并加 `--max-samples 16`；小样本只用于
+检查脚本，不用于挑模型或判断收益。此入口不用 torchrun，也不用启动 CARLA。
+输出目录必须是新的，避免覆盖已有结果。
+默认使用 float32，与现有 CARLA agent 一致；可选 `--amp` 提速，但可能改变接近
+平分的候选排序，正式对齐闭环选轨迹时建议保持默认精度。
+
+脚本按 lidar 路径排序，每个 checkpoint 使用同一批验证帧，并保存
+`samples.json`、每个模型的 `*_samples.jsonl` 和 `*_summary.json`，以及
+`comparison.json`（总表、每条采集路线的统计、相对第一个 checkpoint 的差值）。
+均值按样本计权，保留最后不足一批的数据，不做 DDP 填充重复样本。
+旧残差 checkpoint 仅允许缺少后来新增、在线不使用的两个辅助读取头参数；
+其他缺失、额外参数、形状差异或 anchor 内容不一致都会报错。骨干初始化不下载
+预训练权重，所有在线参数从 checkpoint 加载。
+
+这些是 **执行路径的专家距离诊断**，不是安全真值、PDMS 或 CARLA 闭环得分。
+候选库最小 ADE 变差，提示生成轨迹问题；最小 ADE 稳定但选中 ADE/选择遗憾变差，
+提示排序问题。不过安全绕行也可能增大专家距离，因此需要结合已有闭环日志确认，
+不能仅据此断定碰撞风险或闭环分数改善。
