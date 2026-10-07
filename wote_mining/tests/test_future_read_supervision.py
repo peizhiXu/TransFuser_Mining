@@ -62,7 +62,14 @@ class StableFutureReadTests(unittest.TestCase):
         fixtures.TrainingIntegrationTests.tearDownClass()
 
     def make_module(self):
-        return fixtures.TrainingIntegrationTests().make_training_module()
+        module, batch = fixtures.TrainingIntegrationTests().make_training_module()
+        # This class exercises the optional stable-read ablation explicitly;
+        # the production defaults now use the simpler residual recipe.
+        module.config.wote_stable_future_condition = True
+        module.config.wote_future_read_loss_weight = 0.1
+        module.config.wote_decoded_imitation_loss_weight = 0.0
+        module.planner.stable_future_condition = True
+        return module, batch
 
     def head_outputs(self, module, batch):
         return module.planner.trajectory_head(
@@ -240,13 +247,17 @@ class StableFutureReadTests(unittest.TestCase):
         from wote_mining.WoTE_train import main, parse_args, save_checkpoint
         with patch('sys.argv', ['train', '--root-dir', '/unused']):
             args = parse_args()
-        self.assertEqual(args.future_read_loss_weight, 0.1)
-        self.assertFalse(args.no_stable_future_condition)
-        with patch('sys.argv', ['train', '--root-dir', '/unused',
-                                '--future-read-loss-weight', '0', '--no-stable-future-condition']):
-            args = parse_args()
         self.assertEqual(args.future_read_loss_weight, 0.)
-        self.assertTrue(args.no_stable_future_condition)
+        self.assertEqual(args.decoded_imitation_loss_weight, 0.25)
+        self.assertFalse(args.stable_future_condition)
+        with patch('sys.argv', ['train', '--root-dir', '/unused',
+                                '--future-read-loss-weight', '0.1',
+                                '--decoded-imitation-loss-weight', '0',
+                                '--stable-future-condition']):
+            args = parse_args()
+        self.assertEqual(args.future_read_loss_weight, 0.1)
+        self.assertEqual(args.decoded_imitation_loss_weight, 0.)
+        self.assertTrue(args.stable_future_condition)
         for weight in ('-1', 'nan', 'inf'):
             with patch('sys.argv', ['train', '--root-dir', '/unused',
                                     '--future-read-loss-weight', weight]), self.assertRaises(ValueError):
@@ -260,6 +271,10 @@ class StableFutureReadTests(unittest.TestCase):
             checkpoint = torch.load(path, map_location='cpu')
         self.assertTrue(checkpoint['config']['stable_future_condition'])
         self.assertEqual(checkpoint['config']['loss_weights']['wote_future_read_loss_weight'], 0.1)
+        self.assertEqual(
+            checkpoint['config']['loss_weights']['wote_decoded_imitation_loss_weight'],
+            0.0,
+        )
         module.load_state_dict(checkpoint['model'], strict=True)
 
 

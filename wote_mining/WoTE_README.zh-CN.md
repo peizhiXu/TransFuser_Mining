@@ -36,8 +36,9 @@ CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run \
 ## 当前/未来 BEV 融合
 
 本分支在原版 WoTE 的轨迹解码位置加入未来 BEV，候选与 `anchor + offset`
-轨迹表示不变。当前版本保留原有损失及 reward-topk 多候选轨迹监督，
-并增加稳定未来条件和轻量的未来读取监督：
+轨迹表示不变。当前版本保留原有损失及 reward-topk 多候选轨迹监督，并让原
+reward imitation 分支在训练时额外评价最终解码候选。稳定未来条件和未来读取监督
+保留为消融开关，但默认关闭：
 
 ```text
 固定 anchors / 原候选 queries
@@ -55,7 +56,7 @@ CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run \
                                                │
                                   trajectory = anchor + offset
                                                │
-                                   世界模型②（仅在线推理）
+                                   世界模型②（在线推理；训练评分对齐）
                                                │
                                          reward 一次
 ```
@@ -87,7 +88,7 @@ CARLA 在线推理时，融合后生成的完整轨迹再进入世界模型②�
 reward-topk 轨迹损失不会沿这条条件路径回传到世界模型或骨干。未来注意力、
 AdaLN、offset head 和当前 BEV 主路径仍接受轨迹梯度；动作注入后的未来 tokens
 继续通过原有语义地图与 reward 损失训练。这不是冻结世界模型或共享骨干，
-也没有增加融合前轨迹的辅助监督。当前版本新增一个读取评价头，
+也没有增加融合前轨迹的辅助监督。代码保留一个可选的读取评价头，
 应使用新的输出目录从头训练并单独评估，不直接续训旧 checkpoint。
 
 ### 稳定未来条件与读取监督
@@ -106,7 +107,7 @@ eval，也不冻结世界模型。共享骨干、规划 query 和读取注意力
 `wote_metric_targets[..., :3]` 和有效标签掩码，不使用 reward 预测当伪标签，
 也不重建标签。未来条件基于固定 anchor，标签使用相同候选 ID，不能把它解释成
 融合后新轨迹的安全真值。每项 BCE 独立按有效标签平均，三项相加，
-默认总权重 **0.1**。没有有效标签时贡献连接计算图的零损失。
+默认总权重为 **0（关闭）**。没有有效标签时贡献连接计算图的零损失。
 
 这项损失训练读取注意力、共享归一化、query 路径和新增读取头；由于 scene
 操作数仍 detach，不沿条件路径训练世界模型。辅助头不直接训练 AdaLN，
@@ -119,14 +120,16 @@ AdaLN 仍由原轨迹损失和 reward-topk 轨迹损失训练。
 恢复优化器状态；旧模型闭环测试请继续使用对应旧项目代码。新版本自身的 checkpoint
 支持正常 `--resume`；若改变读取权重、稳定条件或 top-k 设置，重置历史最优总损失。
 
-默认开启，无需新增训练参数；如需显式指定：
+该消融默认关闭；如需重新启用完整的稳定读取实验：
 
 ```bash
---future-read-loss-weight 0.1
+--future-read-loss-weight 0.1 \
+--stable-future-condition
 ```
 
-`--future-read-loss-weight 0` 仅关闭新增损失，不关闭稳定条件；
-`--no-stable-future-condition` 仅取消额外确定性条件前向。训练增加一次不保存反向图的
+`--future-read-loss-weight 0` 仅关闭新增损失；`--stable-future-condition`
+会启用额外确定性条件前向，兼容参数 `--no-stable-future-condition` 可显式关闭。
+启用稳定条件后，训练增加一次不保存反向图的
 世界模型①前向，会有额外计算成本；验证和闭环推理不增加世界模型次数。
 
 TensorBoard 新增 `loss_future_read_metrics`（已乘权重）、
@@ -181,6 +184,28 @@ TensorBoard 新增 `loss_future_read_metrics`（已乘权重）、
 或有效 top-k 覆盖的样本比例）、`traj_reward_topk_{ade,fde}_m`（有效额外候选误差）。
 这些覆盖率/误差不是在线世界模型②的闭环评价结果；ADE/FDE 的统计也受筛选阈值影响。
 
+### 最终解码候选的评分对齐（仅训练/验证）
+
+原固定-anchor reward 与五项指标监督全部保留。在此基础上，训练时将256条
+`anchor + offset` 最终轨迹按在线路径重新编码，复用同一个世界模型和 reward head，
+只对已有 imitation logits 增加专家相似度监督。软目标由完整4秒位姿距离、前1秒
+位置距离和首段速度向量误差共同构成；这不是把专家轨迹当作碰撞或道路安全真值，
+因此不会错误复用固定 anchors 的 NC/DAC/EP 标签。
+
+这条评分支路对输入轨迹和几何目标执行 `detach`：它训练共享轨迹编码器、世界模型
+和 reward head，但不能通过这项损失直接推动 offset 输出贴近答案。轨迹生成仍由
+WTA 与 reward-topk 轨迹损失负责。它不增加模型参数和闭环推理计算，默认权重为
+**0.25**：
+
+```bash
+--decoded-imitation-loss-weight 0.25
+```
+
+设为0会同时跳过这次额外世界模型前向。TensorBoard 的
+`loss_decoded_imitation` 记录加权损失；`traj_decoded_selected_{ade,fde}_m` 记录
+实际解码候选重新评分后的选择误差，`traj_decoded_selection_agreement` 记录它与
+固定-anchor代理选择的一致率。这些仍是录制数据上的专家几何诊断，不等于闭环安全分。
+
 CPU 回归测试（包含筛选、遮罩、梯度、训练图、checkpoint 与256候选测试）：
 
 ```bash
@@ -223,6 +248,7 @@ sigmoid 形式用于兼容矿山版可相互重叠的语义图层。
 `metrics.jsonl` 除联合 loss 外，还记录五个评价头各自的 `bce`、`mae`、
 `pred_mean`、`target_mean` 和 `valid_fraction`，以及轨迹的
 `traj_matched_{ade,fde}_m`、`traj_selected_{ade,fde}_m`、
+`traj_decoded_selected_{ade,fde}_m`、`traj_decoded_selection_agreement`、
 `future_delta_magnitude`、`future_delta_candidate_std`、`future_scale_magnitude`、
 `future_shift_magnitude`、`future_gate_magnitude` 与
 `future_residual_magnitude`。这些项表示 AdaLN-Zero 调制参数及实际残差更新的

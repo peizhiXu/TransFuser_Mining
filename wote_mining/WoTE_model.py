@@ -923,7 +923,7 @@ class WoTEMiningPlanner(nn.Module):
         super().__init__()
         self.backbone = backbone
         self.stable_future_condition = getattr(
-            backbone.config, "wote_stable_future_condition", True
+            backbone.config, "wote_stable_future_condition", False
         )
         # These legacy TransFuser heads are downstream of the 8x8 fused LiDAR
         # map consumed by WoTE.  Freezing them makes the WoTE computation graph
@@ -971,6 +971,33 @@ class WoTEMiningPlanner(nn.Module):
             # Do not retain unused post-injection BEVs for this extra pass.
             return {name: world[name] for name in
                     ("future_scene_tokens", "current_scene_tokens")}
+
+    def score_decoded_trajectories(self, outputs, speed, target_point,
+                                   augmentation_degrees=None):
+        """Train the online scorer on the trajectories it will actually rank.
+
+        Candidate coordinates are detached on this branch: its imitation
+        objective trains the shared trajectory encoder, world model and reward
+        head, but cannot move the decoded trajectories toward its own target.
+        The normal planning losses remain responsible for trajectory geometry.
+        """
+        trajectories = outputs["trajectories"].detach()
+        action_features = self.trajectory_head.encode_trajectory_features(
+            trajectories, speed, target_point
+        )
+        world = self.world_model(
+            outputs["bev_tokens"], action_features, trajectories,
+            augmentation_degrees=augmentation_degrees,
+            predict_future_map=False,
+        )
+        rewards = self.reward_head(
+            outputs["bev_tokens"], world["future_bev_tokens"],
+            action_features, world["future_action_features"],
+        )
+        return {
+            "decoded_imitation_logits": rewards["imitation_logits"],
+            "decoded_final_rewards": rewards["final_rewards"],
+        }
 
     def forward(self, rgb, lidar_bev, speed, target_point,
                 world_candidate_indices=None, augmentation_degrees=None,

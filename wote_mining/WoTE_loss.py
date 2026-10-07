@@ -137,6 +137,51 @@ def future_read_metric_loss(logits, metric_targets, metric_valid):
             / valid.sum(dim=(0, 1)).clamp_min(1.0)).sum()
 
 
+def decoded_trajectory_imitation_loss(logits, trajectories, future_poses):
+    """Supervise online imitation scores on final decoded candidates.
+
+    The target retains WoTE's full-trajectory expert similarity and gives the
+    executable first second extra weight through its two positions and first
+    velocity vector.  Geometry is target construction only: no gradient is
+    allowed from this scoring objective into candidate coordinates.
+    """
+    if logits.ndim != 2:
+        raise ValueError("decoded imitation logits must have shape [B,K]")
+    batch, count = logits.shape
+    if trajectories.shape != (batch, count, 8, 3):
+        raise ValueError("decoded trajectories must have shape [B,K,8,3]")
+    if future_poses.shape != (batch, 8, 3):
+        raise ValueError("future poses must have shape [B,8,3]")
+
+    with torch.no_grad():
+        candidates = trajectories.float()
+        expert = future_poses.float()[:, None]
+        full_distance = torch.linalg.vector_norm(
+            (candidates - expert).flatten(2), dim=-1
+        )
+        prefix_distance = torch.linalg.vector_norm(
+            (candidates[:, :, :2, :2] - expert[:, :, :2, :2]).flatten(2),
+            dim=-1,
+        )
+        # Samples are 0.5 s apart. Multiplying the velocity error by 0.5
+        # converts it back to a displacement-scale penalty.
+        candidate_velocity = 2.0 * (
+            candidates[:, :, 1, :2] - candidates[:, :, 0, :2]
+        )
+        expert_velocity = 2.0 * (
+            expert[:, :, 1, :2] - expert[:, :, 0, :2]
+        )
+        velocity_distance = 0.5 * torch.linalg.vector_norm(
+            candidate_velocity - expert_velocity, dim=-1
+        )
+        target = torch.softmax(
+            -(full_distance + prefix_distance + velocity_distance), dim=-1
+        )
+    return -(target.to(logits) * F.log_softmax(logits.float(), dim=-1)).sum(
+        dim=-1
+    ).mean()
+
+
 def source_style_core_losses(outputs, future_poses, metric_targets=None,
                              metric_valid=None):
     """WTA offset + soft imitation objectives, optionally five metric heads.

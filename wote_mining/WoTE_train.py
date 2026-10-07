@@ -17,6 +17,7 @@ import torch
 from torch import nn
 
 from wote_mining.WoTE_loss import (
+    decoded_trajectory_imitation_loss,
     future_read_metric_loss,
     reward_topk_trajectory_loss,
     select_reward_topk_training_candidates,
@@ -38,6 +39,9 @@ class WoTEMiningTrainingModule(nn.Module):
         if (not math.isfinite(config.wote_future_read_loss_weight)
                 or config.wote_future_read_loss_weight < 0.0):
             raise ValueError("future read loss weight must be finite and nonnegative")
+        if (not math.isfinite(config.wote_decoded_imitation_loss_weight)
+                or config.wote_decoded_imitation_loss_weight < 0.0):
+            raise ValueError("decoded imitation loss weight must be finite and nonnegative")
 
     def _future_map_indices(self, future_poses):
         batch = future_poses.shape[0]
@@ -79,8 +83,13 @@ class WoTEMiningTrainingModule(nn.Module):
             # the current/future-BEV fused trajectory decoder.
             use_fused_world=False,
         )
-        # No new planner modules or world/reward rollout. Selection is solely
-        # a training/validation bookkeeping step and never runs in the agent.
+        if self.config.wote_decoded_imitation_loss_weight > 0.0:
+            outputs.update(self.planner.score_decoded_trajectories(
+                outputs, speed, target_point,
+                augmentation_degrees=batch["wote_augmentation_degrees"].float(),
+            ))
+        # Reward-topk selection itself is training/validation bookkeeping and
+        # never changes the agent's inference procedure.
         topk = (self.config.wote_reward_topk
                 if self.config.wote_reward_topk_loss_weight > 0.0 else 0)
         outputs.update(select_reward_topk_training_candidates(
@@ -107,6 +116,13 @@ class WoTEMiningTrainingModule(nn.Module):
             outputs["future_read_metric_logits"],
             batch["wote_metric_targets"], batch["wote_metric_valid"],
         )
+        if "decoded_imitation_logits" in outputs:
+            raw["loss_decoded_imitation"] = decoded_trajectory_imitation_loss(
+                outputs["decoded_imitation_logits"], outputs["trajectories"],
+                batch["wote_future_poses"].float(),
+            )
+        else:
+            raw["loss_decoded_imitation"] = outputs["imitation_logits"].sum() * 0.0
         raw["loss_current_map"] = current_semantic_map_loss(
             outputs["current_map_logits"],
             batch["wote_current_scene"].float(),
@@ -127,6 +143,7 @@ class WoTEMiningTrainingModule(nn.Module):
             "loss_traj_offset": self.config.wote_traj_offset_loss_weight,
             "loss_reward_topk_traj": self.config.wote_reward_topk_loss_weight,
             "loss_future_read_metrics": self.config.wote_future_read_loss_weight,
+            "loss_decoded_imitation": self.config.wote_decoded_imitation_loss_weight,
             "loss_offset_imitation": self.config.wote_offset_imitation_loss_weight,
             "loss_imitation_reward": self.config.wote_imitation_reward_loss_weight,
             "loss_metric_reward": self.config.wote_metric_reward_loss_weight,
@@ -246,6 +263,24 @@ class WoTEMiningTrainingModule(nn.Module):
             diagnostics[prefix + "_fde_m"] = displacement[:, -1].mean()
             diagnostic_weights[prefix + "_ade_m"] = future.new_tensor(batch_size)
             diagnostic_weights[prefix + "_fde_m"] = future.new_tensor(batch_size)
+        decoded_rewards = outputs.get("decoded_final_rewards")
+        if decoded_rewards is not None:
+            if decoded_rewards.shape != anchors.shape[:2]:
+                raise ValueError("decoded final rewards must have shape [B,K]")
+            decoded_index = decoded_rewards.argmax(dim=1)
+            decoded_trajectory = outputs["trajectories"][batch_index, decoded_index]
+            decoded_distance = torch.linalg.vector_norm(
+                decoded_trajectory[..., :2] - future[..., :2], dim=-1
+            )
+            diagnostics["traj_decoded_selected_ade_m"] = decoded_distance.mean()
+            diagnostics["traj_decoded_selected_fde_m"] = decoded_distance[:, -1].mean()
+            diagnostics["traj_decoded_selection_agreement"] = (
+                decoded_index == selected_index
+            ).float().mean()
+            for name in ("traj_decoded_selected_ade_m",
+                         "traj_decoded_selected_fde_m",
+                         "traj_decoded_selection_agreement"):
+                diagnostic_weights[name] = future.new_tensor(batch_size)
         for name in (
             "future_delta_magnitude",
             "future_scale_magnitude",
@@ -427,8 +462,21 @@ def parse_args():
         help="NC/DAC/EP auxiliary supervision on the future read (0 disables loss)",
     )
     parser.add_argument(
-        "--no-stable-future-condition", action="store_true",
-        help="reuse stochastic World1 features for planning during training",
+        "--decoded-imitation-loss-weight", type=float,
+        default=WoTEMiningConfig.wote_decoded_imitation_loss_weight,
+        help="imitation-score supervision on final decoded candidates (0 disables)",
+    )
+    condition_group = parser.add_mutually_exclusive_group()
+    condition_group.add_argument(
+        "--stable-future-condition", dest="stable_future_condition",
+        action="store_true", help="use an extra dropout-free World1 planning pass",
+    )
+    condition_group.add_argument(
+        "--no-stable-future-condition", dest="stable_future_condition",
+        action="store_false", help="reuse stochastic World1 features for planning",
+    )
+    parser.set_defaults(
+        stable_future_condition=WoTEMiningConfig.wote_stable_future_condition
     )
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--resume", default=None)
@@ -632,6 +680,7 @@ def save_checkpoint(path, model, optimizer, scaler, epoch, args, config,
                     "wote_traj_offset_loss_weight",
                     "wote_reward_topk_loss_weight",
                     "wote_future_read_loss_weight",
+                    "wote_decoded_imitation_loss_weight",
                     "wote_offset_imitation_loss_weight",
                     "wote_imitation_reward_loss_weight",
                     "wote_metric_reward_loss_weight",
@@ -700,6 +749,9 @@ def main():
     if (not math.isfinite(args.future_read_loss_weight)
             or args.future_read_loss_weight < 0.0):
         raise ValueError("--future-read-loss-weight must be finite and nonnegative")
+    if (not math.isfinite(args.decoded_imitation_loss_weight)
+            or args.decoded_imitation_loss_weight < 0.0):
+        raise ValueError("--decoded-imitation-loss-weight must be finite and nonnegative")
     if any(not math.isfinite(value) or value <= 0.0 for value in (
             args.reward_topk_ade_max_m, args.reward_topk_endpoint_max_m)):
         raise ValueError("reward top-k distance thresholds must be finite and positive")
@@ -732,7 +784,8 @@ def main():
     config.wote_reward_topk_ade_max_m = args.reward_topk_ade_max_m
     config.wote_reward_topk_endpoint_max_m = args.reward_topk_endpoint_max_m
     config.wote_future_read_loss_weight = args.future_read_loss_weight
-    config.wote_stable_future_condition = not args.no_stable_future_condition
+    config.wote_decoded_imitation_loss_weight = args.decoded_imitation_loss_weight
+    config.wote_stable_future_condition = args.stable_future_condition
     config.wote_lr = args.lr
     config.wote_min_lr = args.min_lr
     config.wote_weight_decay = args.weight_decay
@@ -780,11 +833,15 @@ def main():
         previous_read_weight = previous_config.get("loss_weights", {}).get(
             "wote_future_read_loss_weight", 0.0
         )
+        previous_decoded_weight = previous_config.get("loss_weights", {}).get(
+            "wote_decoded_imitation_loss_weight", 0.0
+        )
         condition_changed = previous_config.get("stable_future_condition", False) != (
             config.wote_stable_future_condition
         )
         if (previous_signature != current_signature
                 or previous_read_weight != config.wote_future_read_loss_weight
+                or previous_decoded_weight != config.wote_decoded_imitation_loss_weight
                 or condition_changed):
             # Old and new totals have different definitions. Retain optimizer
             # state/epoch, but do not compare the new objective to an old best.
@@ -857,6 +914,12 @@ def main():
             config.wote_reward_topk_ade_max_m,
             config.wote_reward_topk_endpoint_max_m,
         ))
+        print("decoded_imitation_weight=%.3f future_read_weight=%.3f "
+              "stable_future_condition=%s" % (
+                  config.wote_decoded_imitation_loss_weight,
+                  config.wote_future_read_loss_weight,
+                  config.wote_stable_future_condition,
+              ))
 
     for epoch in range(start_epoch, args.epochs):
         if train_sampler is not None:
