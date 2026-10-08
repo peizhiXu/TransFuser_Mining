@@ -14,34 +14,9 @@ import torch
 from torch import nn
 
 from wote_mining.WoTE_loss import (
-    decoded_trajectory_imitation_loss,
     reward_topk_trajectory_loss,
     select_reward_topk_training_candidates,
 )
-
-
-class DecodedImitationLossTests(unittest.TestCase):
-    def test_prefers_expert_geometry_and_detaches_target_trajectories(self):
-        trajectories = torch.zeros(1, 3, 8, 3, requires_grad=True)
-        with torch.no_grad():
-            trajectories[0, 1, :2, 0] = 1.0
-            trajectories[0, 2, 4:, 0] = 1.0
-        logits = torch.zeros(1, 3, requires_grad=True)
-        loss = decoded_trajectory_imitation_loss(
-            logits, trajectories, torch.zeros(1, 8, 3)
-        )
-        loss.backward()
-        self.assertTrue(torch.isfinite(loss))
-        self.assertIsNone(trajectories.grad)
-        self.assertLess(logits.grad[0, 0].item(), logits.grad[0, 2].item())
-        self.assertLess(logits.grad[0, 0].item(), logits.grad[0, 1].item())
-
-    def test_rejects_incompatible_shapes(self):
-        with self.assertRaises(ValueError):
-            decoded_trajectory_imitation_loss(
-                torch.zeros(2, 3), torch.zeros(2, 3, 7, 3),
-                torch.zeros(2, 8, 3),
-            )
 
 
 class RewardTopKSelectionTests(unittest.TestCase):
@@ -343,38 +318,6 @@ class TrainingIntegrationTests(unittest.TestCase):
                 gradient = module.planner.world_model.action_encoder[0].weight.grad
                 self.assertGreater(gradient.abs().sum().item(), 0.)
 
-    def test_decoded_imitation_trains_only_scorer(self):
-        torch.manual_seed(7)
-        module, batch = self.make_training_module()
-        module.eval()
-        outputs = module(batch)
-        trajectories = outputs['trajectories']
-        trajectories.retain_grad()
-        loss = module.compute_losses(batch, outputs)['loss_decoded_imitation']
-        self.assertGreater(loss.item(), 0.)
-        loss.backward()
-        self.assertIsNone(trajectories.grad)
-        self.assertIsNone(module.planner.trajectory_head.offset_head.weight.grad)
-        self.assertGreater(
-            module.planner.reward_head.imitation_head[-1].weight.grad.abs().sum().item(),
-            0.,
-        )
-        self.assertTrue(all(parameter.grad is None for parameter in
-                            module.planner.world_model.parameters()))
-        self.assertTrue(all(parameter.grad is None for parameter in
-                            module.planner.trajectory_head.parameters()))
-        self.assertTrue(all(parameter.grad is None for parameter in
-                            module.planner.backbone.parameters()))
-        self.assertFalse(outputs['decoded_final_rewards'].requires_grad)
-
-    def test_decoded_imitation_can_be_disabled_without_online_rollout(self):
-        module, batch = self.make_training_module()
-        module.config.wote_decoded_imitation_loss_weight = 0.
-        outputs = module(batch)
-        self.assertNotIn('decoded_imitation_logits', outputs)
-        loss = module.compute_losses(batch, outputs)['loss_decoded_imitation']
-        self.assertEqual(loss.item(), 0.)
-
     def test_checkpoint_records_settings_without_adding_model_parameters(self):
         from wote_mining.WoTE_train import save_checkpoint
         module, _ = self.make_training_module()
@@ -388,10 +331,6 @@ class TrainingIntegrationTests(unittest.TestCase):
         self.assertEqual(checkpoint['config']['reward_topk_supervision'],
                          dict(topk=4, ade_max_m=1., endpoint_max_m=2.))
         self.assertEqual(checkpoint['config']['loss_weights']['wote_reward_topk_loss_weight'], 0.25)
-        self.assertEqual(
-            checkpoint['config']['loss_weights']['wote_decoded_imitation_loss_weight'],
-            0.25,
-        )
         self.assertFalse(any('topk' in name for name in checkpoint['model']))
         module.load_state_dict(checkpoint['model'], strict=True)
 
@@ -402,7 +341,6 @@ class TrainingIntegrationTests(unittest.TestCase):
         self.assertEqual((args.reward_topk, args.reward_topk_loss_weight,
                           args.reward_topk_ade_max_m, args.reward_topk_endpoint_max_m),
                          (4, 0.25, 1., 2.))
-        self.assertEqual(args.decoded_imitation_loss_weight, 0.25)
         with patch('sys.argv', ['WoTE_train.py', '--root-dir', '/unused',
                                 '--reward-topk', '2', '--reward-topk-loss-weight', '0.1',
                                 '--reward-topk-ade-max-m', '0.8',
@@ -429,8 +367,6 @@ class TrainingIntegrationTests(unittest.TestCase):
         for arguments in [('--reward-topk', '-1'), ('--reward-topk', '256'),
                           ('--reward-topk-loss-weight', '-0.1'),
                           ('--reward-topk-loss-weight', 'nan'),
-                          ('--decoded-imitation-loss-weight', '-0.1'),
-                          ('--decoded-imitation-loss-weight', 'inf'),
                           ('--reward-topk-ade-max-m', '0'),
                           ('--reward-topk-endpoint-max-m', 'inf')]:
             with self.subTest(arguments=arguments), patch(

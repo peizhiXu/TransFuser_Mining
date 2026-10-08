@@ -10,7 +10,6 @@ together in this module so the complete WoTE model is easy to locate.
 """
 
 import math
-from contextlib import contextmanager
 
 import torch
 from torch import nn
@@ -22,19 +21,6 @@ BEV_METERS = 32.0
 MAP_SIDE = 160
 SOURCE_FOCAL_ALPHA = 0.5
 SOURCE_FOCAL_GAMMA = 2.0
-
-
-@contextmanager
-def temporary_eval(*roots):
-    """Disable condition-path dropout, restoring even mixed nested modes."""
-    states = [(module, module.training) for root in roots for module in root.modules()]
-    try:
-        for root in roots:
-            root.eval()
-        yield
-    finally:
-        for module, training in states:
-            module.training = training
 
 
 def masked_sigmoid_focal_loss(logits, target, valid,
@@ -717,9 +703,6 @@ class WoTEMiningTrajectoryHead(nn.Module):
         self.future_bev_attention = nn.MultiheadAttention(
             hidden_dim, heads, dropout=0.1, batch_first=True
         )
-        # Supervise what was actually read, not the current feature or the
-        # reward head's output. NC / DAC / EP labels describe fixed anchors.
-        self.future_read_metric_head = nn.Linear(hidden_dim, 3)
         # The current-BEV decoder remains the main planning path.  The
         # candidate-aligned future read conditions a lightweight AdaLN-Zero
         # residual branch.  Its final conditioning projection is zero-
@@ -771,7 +754,7 @@ class WoTEMiningTrajectoryHead(nn.Module):
         )
 
     def fuse_future_bev(self, outputs, future_scene_tokens,
-                        current_scene_tokens, predict_auxiliary=True):
+                        current_scene_tokens):
         """Decode offsets after reading candidate-conditioned scene changes.
 
         Each fixed-anchor query attends to the difference between its own
@@ -833,7 +816,7 @@ class WoTEMiningTrajectoryHead(nn.Module):
         gated_future_update = future_gate * future_update
         decoded = current_bev_features + gated_future_update
         offsets = self.offset_head(decoded).reshape_as(anchors)
-        fused = {
+        return {
             "offsets": offsets,
             "trajectories": anchors + offsets,
             "scores": self.score_head(decoded).squeeze(-1),
@@ -847,22 +830,11 @@ class WoTEMiningTrajectoryHead(nn.Module):
             "future_delta_candidate_std": future_delta_tokens.std(
                 dim=1, unbiased=False
             ).mean(dim=(-1, -2)),
-            "future_scene_candidate_std": future_scene_tokens.detach().float().std(
-                dim=1, unbiased=False
-            ).mean(dim=(-1, -2)),
-            "future_read_candidate_std": future_delta_features.detach().float().std(
-                dim=1, unbiased=False
-            ).mean(dim=-1),
             "future_scale_magnitude": future_scale.abs().mean(dim=-1),
             "future_shift_magnitude": future_shift.abs().mean(dim=-1),
             "future_gate_magnitude": future_gate.abs().mean(dim=-1),
             "future_residual_magnitude": gated_future_update.abs().mean(dim=-1),
         }
-        if predict_auxiliary:
-            fused["future_read_metric_logits"] = self.future_read_metric_head(
-                future_delta_features
-            )
-        return fused
 
     def forward(self, fused_lidar, speed, target_point):
         if fused_lidar.ndim != 4 or fused_lidar.shape[1:] != (512, 8, 8):
@@ -922,9 +894,6 @@ class WoTEMiningPlanner(nn.Module):
     def __init__(self, backbone, anchors_path):
         super().__init__()
         self.backbone = backbone
-        self.stable_future_condition = getattr(
-            backbone.config, "wote_stable_future_condition", False
-        )
         # These legacy TransFuser heads are downstream of the 8x8 fused LiDAR
         # map consumed by WoTE.  Freezing them makes the WoTE computation graph
         # valid under DDP without find_unused_parameters=True and also keeps
@@ -948,60 +917,6 @@ class WoTEMiningPlanner(nn.Module):
         self.current_agent_head = WoTEMiningAgentHead(
             lidar_x=backbone.config.lidar_pos[0]
         )
-
-    @torch.no_grad()
-    def planning_future_condition(self, outputs, speed, target_point,
-                                  augmentation_degrees=None):
-        """A deterministic detached condition; normal world training is intact.
-
-        Re-encode actions too: anchor_context dropout otherwise enters the
-        world model even if its transition dropout is disabled. The shared
-        backbone and the planning reader keep their normal training modes.
-        """
-        with temporary_eval(self.trajectory_head.anchor_context,
-                            self.world_model.transition):
-            actions = self.trajectory_head.encode_trajectory_features(
-                outputs["anchors"], speed, target_point
-            )
-            world = self.world_model(
-                outputs["bev_tokens"], actions, outputs["anchors"],
-                augmentation_degrees=augmentation_degrees,
-                predict_future_map=False,
-            )
-            # Do not retain unused post-injection BEVs for this extra pass.
-            return {name: world[name] for name in
-                    ("future_scene_tokens", "current_scene_tokens")}
-
-    def score_decoded_trajectories(self, outputs, speed, target_point,
-                                   augmentation_degrees=None):
-        """Train the online scorer on the trajectories it will actually rank.
-
-        Candidate/world features are frozen conditions on this branch.  The
-        imitation objective calibrates only the existing reward scorer; normal
-        map/reward losses still train the world model, and planning losses remain
-        responsible for trajectory geometry.  Besides separating these roles,
-        this avoids retaining a second 256-candidate world-model backward graph.
-        """
-        with torch.no_grad():
-            trajectories = outputs["trajectories"].detach()
-            current_bev = outputs["bev_tokens"].detach()
-            action_features = self.trajectory_head.encode_trajectory_features(
-                trajectories, speed, target_point
-            )
-            world = self.world_model(
-                current_bev, action_features, trajectories,
-                augmentation_degrees=augmentation_degrees,
-                predict_future_map=False,
-            )
-        rewards = self.reward_head(
-            current_bev, world["future_bev_tokens"],
-            action_features, world["future_action_features"],
-        )
-        return {
-            "decoded_imitation_logits": rewards["imitation_logits"],
-            # Selection diagnostics never contribute a second metric loss.
-            "decoded_final_rewards": rewards["final_rewards"].detach(),
-        }
 
     def forward(self, rgb, lidar_bev, speed, target_point,
                 world_candidate_indices=None, augmentation_degrees=None,
@@ -1027,14 +942,9 @@ class WoTEMiningPlanner(nn.Module):
             augmentation_degrees=augmentation_degrees,
             predict_future_map=False,
         )
-        condition = anchor_world
-        if self.training and self.stable_future_condition:
-            condition = self.planning_future_condition(
-                result, speed, target_point, augmentation_degrees
-            )
         result.update(self.trajectory_head.fuse_future_bev(
-            result, condition["future_scene_tokens"],
-            condition["current_scene_tokens"], predict_auxiliary=predict_auxiliary,
+            result, anchor_world["future_scene_tokens"],
+            anchor_world["current_scene_tokens"],
         ))
 
         if use_fused_world:
