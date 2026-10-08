@@ -343,7 +343,7 @@ class TrainingIntegrationTests(unittest.TestCase):
                 gradient = module.planner.world_model.action_encoder[0].weight.grad
                 self.assertGreater(gradient.abs().sum().item(), 0.)
 
-    def test_decoded_imitation_trains_scorer_without_moving_trajectory_output(self):
+    def test_decoded_imitation_trains_only_scorer(self):
         torch.manual_seed(7)
         module, batch = self.make_training_module()
         module.eval()
@@ -359,10 +359,13 @@ class TrainingIntegrationTests(unittest.TestCase):
             module.planner.reward_head.imitation_head[-1].weight.grad.abs().sum().item(),
             0.,
         )
-        self.assertGreater(
-            module.planner.world_model.action_encoder[0].weight.grad.abs().sum().item(),
-            0.,
-        )
+        self.assertTrue(all(parameter.grad is None for parameter in
+                            module.planner.world_model.parameters()))
+        self.assertTrue(all(parameter.grad is None for parameter in
+                            module.planner.trajectory_head.parameters()))
+        self.assertTrue(all(parameter.grad is None for parameter in
+                            module.planner.backbone.parameters()))
+        self.assertFalse(outputs['decoded_final_rewards'].requires_grad)
 
     def test_decoded_imitation_can_be_disabled_without_online_rollout(self):
         module, batch = self.make_training_module()

@@ -976,27 +976,31 @@ class WoTEMiningPlanner(nn.Module):
                                    augmentation_degrees=None):
         """Train the online scorer on the trajectories it will actually rank.
 
-        Candidate coordinates are detached on this branch: its imitation
-        objective trains the shared trajectory encoder, world model and reward
-        head, but cannot move the decoded trajectories toward its own target.
-        The normal planning losses remain responsible for trajectory geometry.
+        Candidate/world features are frozen conditions on this branch.  The
+        imitation objective calibrates only the existing reward scorer; normal
+        map/reward losses still train the world model, and planning losses remain
+        responsible for trajectory geometry.  Besides separating these roles,
+        this avoids retaining a second 256-candidate world-model backward graph.
         """
-        trajectories = outputs["trajectories"].detach()
-        action_features = self.trajectory_head.encode_trajectory_features(
-            trajectories, speed, target_point
-        )
-        world = self.world_model(
-            outputs["bev_tokens"], action_features, trajectories,
-            augmentation_degrees=augmentation_degrees,
-            predict_future_map=False,
-        )
+        with torch.no_grad():
+            trajectories = outputs["trajectories"].detach()
+            current_bev = outputs["bev_tokens"].detach()
+            action_features = self.trajectory_head.encode_trajectory_features(
+                trajectories, speed, target_point
+            )
+            world = self.world_model(
+                current_bev, action_features, trajectories,
+                augmentation_degrees=augmentation_degrees,
+                predict_future_map=False,
+            )
         rewards = self.reward_head(
-            outputs["bev_tokens"], world["future_bev_tokens"],
+            current_bev, world["future_bev_tokens"],
             action_features, world["future_action_features"],
         )
         return {
             "decoded_imitation_logits": rewards["imitation_logits"],
-            "decoded_final_rewards": rewards["final_rewards"],
+            # Selection diagnostics never contribute a second metric loss.
+            "decoded_final_rewards": rewards["final_rewards"].detach(),
         }
 
     def forward(self, rgb, lidar_bev, speed, target_point,
