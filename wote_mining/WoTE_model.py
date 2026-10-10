@@ -921,7 +921,12 @@ class WoTEMiningPlanner(nn.Module):
     def forward(self, rgb, lidar_bev, speed, target_point,
                 world_candidate_indices=None, augmentation_degrees=None,
                 predict_future_map=False, future_map_candidate_indices=None,
-                predict_auxiliary=True, use_fused_world=True):
+                predict_auxiliary=True, use_fused_world=True,
+                reuse_anchor_rewards=False):
+        # Inference ablation: score anchors but execute the same decoded
+        # candidate set. Never change the existing training selection path.
+        if reuse_anchor_rewards and (self.training or not use_fused_world):
+            raise ValueError("reuse_anchor_rewards requires eval mode and use_fused_world=True")
         # WoTE asks the local backbone for its fused 512x8x8 LiDAR map before
         # the legacy TransFuser output heads.
         fused_lidar = self.backbone(
@@ -947,7 +952,7 @@ class WoTEMiningPlanner(nn.Module):
             anchor_world["current_scene_tokens"],
         ))
 
-        if use_fused_world:
+        if use_fused_world and not reuse_anchor_rewards:
             # World model 2 evaluates the consequences of the complete fused
             # trajectories.  Reward is still evaluated only once, below.
             world_action_features = self.trajectory_head.encode_trajectory_features(
@@ -1011,8 +1016,15 @@ class WoTEMiningPlanner(nn.Module):
             scored_action_features, world["future_action_features"],
         )
         result.update(rewards)
+        execution_trajectories = world["world_trajectories"]
+        if reuse_anchor_rewards:
+            execution_trajectories = result["trajectories"]
+            if world_candidate_indices is not None:
+                execution_trajectories = execution_trajectories.gather(
+                    1, world_candidate_indices[:, :, None, None].expand(-1, -1, 8, 3)
+                )
         result.update(select_best_trajectory(
-            rewards["final_rewards"], world["world_trajectories"],
+            rewards["final_rewards"], execution_trajectories,
             world_candidate_indices,
         ))
         return result

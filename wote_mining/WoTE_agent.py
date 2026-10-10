@@ -2,6 +2,7 @@
 
 from collections import deque
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -123,6 +124,13 @@ class WoTEMiningInferenceModel(nn.Module):
             )
             planner = WoTEMiningPlanner(backbone, anchors_path)
         self.planner = planner
+        self.world_passes = os.environ.get("WOTE_WORLD_PASSES", "1")
+        if self.world_passes not in ("1", "2"):
+            raise ValueError("WOTE_WORLD_PASSES must be 1 or 2")
+        print("WoTE inference: world_passes=%s; reward_source=%s; execution=decoded_trajectories" % (
+            self.world_passes,
+            "anchor_proxy" if self.world_passes == "1" else "decoded_world",
+        ), flush=True)
         self.config = config
         self.controller = HD465TrajectoryController(config)
         self.last_diagnostics = {}
@@ -271,6 +279,7 @@ class WoTEMiningInferenceModel(nn.Module):
             augmentation_degrees=ego_vel.new_zeros(ego_vel.shape[0]),
             predict_future_map=False,
             predict_auxiliary=False,
+            reuse_anchor_rewards=(self.world_passes == "1"),
         )
         selected = outputs["selected_trajectory"]
         batch_index = torch.arange(selected.shape[0], device=selected.device)
@@ -278,6 +287,9 @@ class WoTEMiningInferenceModel(nn.Module):
         selected_metrics = outputs["metric_scores"][batch_index, selected_local]
         selected_rewards = outputs["final_rewards"][batch_index, selected_local]
         self.last_diagnostics = {
+            "world_passes": int(self.world_passes),
+            "reward_source": "anchor_proxy" if self.world_passes == "1" else "decoded_world",
+            "execution_source": "decoded_trajectories",
             "selected_anchor_index": int(
                 outputs["selected_anchor_index"][0].detach().cpu()
             ),
