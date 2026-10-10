@@ -760,9 +760,9 @@ class WoTEMiningTrajectoryHead(nn.Module):
         Each fixed-anchor query attends to the difference between its own
         pre-injection future scene and the aligned current scene.  A shared
         LayerNorm keeps both operands in one feature space without adding
-        redundant projectors.  Both scene operands are detached conditions:
-        trajectory losses train the reader and modulation, while world-model
-        map/reward losses retain their original differentiable path.
+        redundant projectors.  Both scene operands remain differentiable so
+        trajectory losses jointly train the residual reader, modulation, and
+        the action-conditioned world representation.
         """
         anchors = outputs["anchors"]
         anchor_features = outputs["anchor_features"]
@@ -784,11 +784,11 @@ class WoTEMiningTrajectoryHead(nn.Module):
         ):
             raise ValueError("current_scene_tokens must have shape [B,64,C]")
 
-        # The main current-BEV decoder remains differentiable.  Only the two
-        # operands used to construct the temporal condition are detached.
-        normalized_future = self.future_bev_norm(future_scene_tokens.detach())
+        # Joint planning/world training ablation: trajectory gradients pass
+        # through both operands used to construct the temporal condition.
+        normalized_future = self.future_bev_norm(future_scene_tokens)
         normalized_current = self.future_bev_norm(
-            current_scene_tokens.detach()
+            current_scene_tokens
         ).unsqueeze(1)
         future_delta_tokens = normalized_future - normalized_current
         future_reads = []

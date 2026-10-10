@@ -271,7 +271,7 @@ class TrainingIntegrationTests(unittest.TestCase):
         self.assertEqual(online['trajectories'].shape, (1, 8, 8, 3))
         self.assertTrue(torch.equal(online['world_trajectories'], online['trajectories']))
 
-    def test_trajectory_losses_stop_at_future_condition_but_train_fusion(self):
+    def test_trajectory_losses_train_future_condition_and_fusion(self):
         for loss_name in ('loss_traj_offset', 'loss_reward_topk_traj'):
             with self.subTest(loss=loss_name):
                 torch.manual_seed(7)
@@ -295,10 +295,14 @@ class TrainingIntegrationTests(unittest.TestCase):
                 self.assertGreater(losses[loss_name].item(), 0.)
                 losses[loss_name].backward()
                 self.assertIsNone(future.grad)
-                self.assertIsNone(future_scene.grad)
-                self.assertIsNone(current_scene.grad)
-                self.assertTrue(all(parameter.grad is None
-                                    for parameter in module.planner.world_model.parameters()))
+                self.assertGreater(future_scene.grad.abs().sum().item(), 0.)
+                self.assertGreater(current_scene.grad.abs().sum().item(), 0.)
+                world_gradient = sum(
+                    parameter.grad.abs().sum().item()
+                    for parameter in module.planner.world_model.parameters()
+                    if parameter.grad is not None
+                )
+                self.assertGreater(world_gradient, 0.)
                 for layer in (head.offset_head, head.future_adaln_modulation[-1],
                               head.future_update_mlp[-1], module.planner.backbone.projection):
                     self.assertGreater(layer.weight.grad.abs().sum().item(), 0.)
@@ -409,8 +413,8 @@ class AdaLNGradientTests(unittest.TestCase):
                           head.future_update_mlp[-1]):
                 self.assertGreater(layer.weight.grad.abs().sum().item(), 0.)
             self.assertGreater(head.future_bev_attention.in_proj_weight.grad.abs().sum().item(), 0.)
-            self.assertIsNone(future.grad)
-            self.assertIsNone(current_scene.grad)
+            self.assertGreater(future.grad.abs().sum().item(), 0.)
+            self.assertGreater(current_scene.grad.abs().sum().item(), 0.)
             self.assertIsNone(rewards.grad)
         finally:
             torch.set_num_threads(previous_threads)
