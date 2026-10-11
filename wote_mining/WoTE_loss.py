@@ -108,9 +108,9 @@ def reward_topk_trajectory_loss(outputs, future_poses):
 
 def source_style_core_losses(outputs, future_poses, metric_targets=None,
                              metric_valid=None):
-    """WTA offset + soft imitation objectives, optionally five metric heads.
+    """WTA offset + soft imitation objectives and named candidate metric heads.
 
-    ``metric_targets`` [B,K,5], if supplied, must be independently defined
+    ``metric_targets`` [B,K,M], if supplied, must be independently defined
     candidate-level values in [0,1]. ``metric_valid`` masks any unavailable
     candidate/metric labels. The function does not include map/agent losses;
     their matching and spatial masks live with those modules.
@@ -150,8 +150,8 @@ def source_style_core_losses(outputs, future_poses, metric_targets=None,
     }
 
     if metric_targets is not None:
-        if metric_targets.shape != (batch, count, 5):
-            raise ValueError("metric_targets must have shape [B,K,5]")
+        if metric_targets.ndim != 3 or metric_targets.shape[:2] != (batch, count):
+            raise ValueError("metric_targets must have shape [B,K,M]")
         if not torch.isfinite(metric_targets).all() or (
             (metric_targets < 0) | (metric_targets > 1)
         ).any():
@@ -170,7 +170,7 @@ def source_style_core_losses(outputs, future_poses, metric_targets=None,
             losses["loss_metric_reward"] = elementwise.mean(dim=(0, 1)).sum()
         else:
             if metric_valid.shape != metric_targets.shape:
-                raise ValueError("metric_valid must have shape [B,K,5]")
+                raise ValueError("metric_valid must match metric_targets [B,K,M]")
             valid = metric_valid.to(device=metric_logits.device, dtype=metric_logits.dtype)
             valid_count = valid.sum(dim=(0, 1))
             per_metric = (elementwise * valid).sum(dim=(0, 1)) / valid_count.clamp_min(1)

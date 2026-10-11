@@ -31,6 +31,14 @@ class CARLA_Data(Dataset):
         self.wote_future_scene_targets = bool(getattr(config, 'wote_future_scene_targets', False))
         self.wote_dense_routes_dir = getattr(config, 'wote_dense_routes_dir', None)
         self.wote_metric_cache_dir = getattr(config, 'wote_metric_cache_dir', None)
+        self.wote_metric_names = None
+        self.wote_boundary_target_m = None
+        if self.wote_metric_cache_dir:
+            from wote_mining.WoTE_reward_schema import metric_names_for_scheme
+            scheme = getattr(config, 'wote_reward_scheme', 'source')
+            self.wote_metric_names = metric_names_for_scheme(scheme)
+            if scheme == 'mining_boundary':
+                self.wote_boundary_target_m = config.wote_boundary_target_m
         if self.wote_future_poses and (int(self.pred_len) != 8 or int(self.seq_len) != 1):
             raise ValueError('WoTE mining targets require seq_len=1 and pred_len=8')
         if self.wote_future_scene_targets and not self.wote_future_poses:
@@ -94,7 +102,9 @@ class CARLA_Data(Dataset):
                 if self.wote_metric_cache_dir:
                     from wote_mining.WoTE_targets import metric_cache_file_for_collection
                     wote_metric_cache_file = metric_cache_file_for_collection(
-                        route_dir, self.wote_metric_cache_dir
+                        route_dir, self.wote_metric_cache_dir,
+                        metric_names=self.wote_metric_names,
+                        boundary_target_m=self.wote_boundary_target_m,
                     )
                 else:
                     wote_metric_cache_file = None
@@ -433,7 +443,7 @@ class CARLA_Data(Dataset):
                 )
                 cache = self._wote_metric_cache.get(cache_path)
                 if cache is None:
-                    cache = load_metric_cache_shard(cache_path)
+                    cache = load_metric_cache_shard(cache_path, metric_names=self.wote_metric_names)
                     self._wote_metric_cache[cache_path] = cache
                 current_frame = int(Path(
                     str(self.labels[index, 0], encoding='utf-8')

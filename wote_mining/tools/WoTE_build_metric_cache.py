@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Precompute WoTE-style five-metric labels for HD465 trajectory anchors."""
+"""Precompute source or mining-boundary labels for HD465 trajectory anchors."""
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -18,7 +18,11 @@ sys.path.insert(0, str(ROOT))
 from wote_mining.tools.WoTE_build_anchors import (
     load_assignments, route_key,
 )
-from wote_mining.WoTE_targets import recorded_vehicle_tracks, METRIC_NAMES
+from wote_mining.WoTE_targets import recorded_vehicle_tracks
+from wote_mining.WoTE_reward_schema import (
+    REWARD_SCHEMES, BOUNDARY_LABEL_VERSION, metric_names_for_scheme,
+    validate_boundary_settings,
+)
 from wote_mining.WoTE_simulator import evaluate_mining_candidates
 from wote_mining.WoTE_simulator import (
     dense_route_file_for_collection, local_route_window,
@@ -34,6 +38,8 @@ def parse_args():
     parser.add_argument("--routes-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--split", choices=("train", "val"), default="train")
+    parser.add_argument("--reward-scheme", choices=REWARD_SCHEMES, default="source")
+    parser.add_argument("--boundary-target-m", type=float, default=0.6)
     parser.add_argument("--max-routes", type=int, default=None)
     parser.add_argument("--max-frames-per-route", type=int, default=None)
     parser.add_argument(
@@ -58,7 +64,8 @@ def _valid_frames(route):
     return list(range(2, count - 8 - 1 - 2))
 
 
-def _evaluate_frame(route, frame, anchors, route_world_xy):
+def _evaluate_frame(route, frame, anchors, route_world_xy,
+                    reward_scheme="source", boundary_target_m=0.6):
     labels = _load_labels(route, frame)
     ego_id = labels[0][0]["id"]
     ego = next(item for item in labels[0] if item.get("id") == ego_id)
@@ -72,25 +79,27 @@ def _evaluate_frame(route, frame, anchors, route_world_xy):
     road = decode_topdown_scene(topdown)[0]
     tracks = recorded_vehicle_tracks(ego_matrix, labels)
     result = evaluate_mining_candidates(
-        anchors, road, route_xy, recorded_tracks=tracks
+        anchors, road, route_xy, recorded_tracks=tracks,
+        reward_scheme=reward_scheme, boundary_target_m=boundary_target_m,
     )
     return result["metric_targets"], result["metric_valid"]
 
 
 def _write_manifest(output_dir, args, anchors_sha256, routes):
+    names = metric_names_for_scheme(args.reward_scheme)
     total_frames = sum(item["frames"] for item in routes.values())
     target_counts = np.sum(
         [np.asarray(item["target_positive_counts"], dtype=np.int64)
          for item in routes.values()], axis=0,
-    ) if routes else np.zeros(5, dtype=np.int64)
+    ) if routes else np.zeros(len(names), dtype=np.int64)
     target_sums = np.sum(
         [np.asarray(item["target_sums"], dtype=np.float64)
          for item in routes.values()], axis=0,
-    ) if routes else np.zeros(5, dtype=np.float64)
+    ) if routes else np.zeros(len(names), dtype=np.float64)
     valid_counts = np.sum(
         [np.asarray(item["valid_counts"], dtype=np.int64)
          for item in routes.values()], axis=0,
-    ) if routes else np.zeros(5, dtype=np.int64)
+    ) if routes else np.zeros(len(names), dtype=np.int64)
     manifest = {
         "format_version": 1,
         "split": args.split,
@@ -102,7 +111,8 @@ def _write_manifest(output_dir, args, anchors_sha256, routes):
         "anchors": str(args.anchors.resolve()),
         "anchors_sha256": anchors_sha256,
         "anchor_count": 256,
-        "metric_names": list(METRIC_NAMES),
+        "metric_names": list(names),
+        "reward_scheme": args.reward_scheme,
         "route_count": len(routes),
         "frame_count": total_frames,
         "valid_counts": valid_counts.tolist(),
@@ -110,6 +120,13 @@ def _write_manifest(output_dir, args, anchors_sha256, routes):
         "target_sums": target_sums.tolist(),
         "routes": routes,
     }
+    if args.reward_scheme == "mining_boundary":
+        manifest["boundary_label_settings"] = dict(
+            version=BOUNDARY_LABEL_VERSION, target_m=args.boundary_target_m,
+            vehicle_length_m=9.3969, vehicle_width_m=5.3645,
+            footprint_spacing_m=0.5, sample_interval_s=0.125,
+            includes_current_pose=False,
+        )
     (output_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
@@ -118,6 +135,7 @@ def _write_manifest(output_dir, args, anchors_sha256, routes):
 
 def main():
     args = parse_args()
+    validate_boundary_settings(args.boundary_target_m, 0.0)
     if args.max_routes is not None and args.max_routes < 1:
         raise ValueError("max-routes must be positive")
     if args.max_frames_per_route is not None and args.max_frames_per_route < 1:
@@ -163,6 +181,7 @@ def main():
         evaluate = partial(
             _evaluate_frame, route, anchors=anchors,
             route_world_xy=route_world_xy,
+            reward_scheme=args.reward_scheme, boundary_target_m=args.boundary_target_m,
         )
         if args.workers == 1:
             evaluated = map(evaluate, frames)
@@ -202,6 +221,26 @@ def main():
             ),
             "seconds": round(time.monotonic() - started, 3),
         }
+        if args.reward_scheme == "mining_boundary":
+            boundary = targets[..., 3]
+            observed = valid[..., 3].astype(bool)
+            values = boundary[observed]
+            # Candidate differences are measured among DAC-passing candidates,
+            # so merely separating off-road modes cannot masquerade as margin
+            # discrimination. A zero fraction flags an uninformative target.
+            eligible = observed & valid[..., 1].astype(bool) & (targets[..., 1] > 0.5)
+            distinct = []
+            for scores, keep in zip(boundary, eligible):
+                if keep.sum() >= 2:
+                    distinct.append(float(scores[keep].std()))
+            stats = dict(
+                mean=float(values.mean()) if values.size else None,
+                saturated_fraction=float((values >= 1.0 - 1e-6).mean()) if values.size else None,
+                partial_fraction=float(((values > 0) & (values < 1.0 - 1e-6)).mean()) if values.size else None,
+                compliant_candidate_std_mean=float(np.mean(distinct)) if distinct else None,
+            )
+            route_entries[route.name]["boundary_diagnostics"] = stats
+            print("boundary diagnostics %s: %s" % (route.name, json.dumps(stats)), flush=True)
         _write_manifest(
             args.output_dir, args, anchors_sha256, route_entries
         )

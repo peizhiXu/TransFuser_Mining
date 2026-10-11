@@ -30,6 +30,9 @@ def reward_topk_diagnostics(outputs, topk=4):
     metrics = outputs["metric_scores"][0].index_select(
         0, device_indices
     ).detach().cpu().tolist()
+    metric_names = outputs.get("metric_names", METRIC_NAMES)
+    if any(len(values) != len(metric_names) for values in metrics):
+        raise ValueError("candidate telemetry metric names do not match scores")
     candidates = []
     for rank, index in enumerate(indices):
         trajectory = trajectories[rank]
@@ -40,7 +43,7 @@ def reward_topk_diagnostics(outputs, topk=4):
             "selected": index == selected,
             "reward": float(rewards[index]),
             "learned_desired_speed_mps": speed,
-            "metric_scores": dict(zip(METRIC_NAMES, metrics[rank])),
+            "metric_scores": dict(zip(metric_names, metrics[rank])),
             "trajectory": trajectory.tolist(),
         })
     return {"reward_topk_candidates": candidates}

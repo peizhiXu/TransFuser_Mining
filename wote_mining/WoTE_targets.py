@@ -290,16 +290,14 @@ from pathlib import Path
 import numpy as np
 
 
-METRIC_NAMES = (
-    "no_collision",
-    "drivable_compliance",
-    "ego_progress",
-    "time_to_collision",
-    "comfort",
+from wote_mining.WoTE_reward_schema import (
+    SOURCE_METRIC_NAMES as METRIC_NAMES, BOUNDARY_LABEL_VERSION,
 )
 
 
-def metric_cache_file_for_collection(route_dir, cache_dir):
+def metric_cache_file_for_collection(route_dir, cache_dir,
+                                     metric_names=METRIC_NAMES,
+                                     boundary_target_m=None):
     """Resolve one raw collection folder through the cache manifest."""
     cache_dir = Path(cache_dir)
     route_name = Path(route_dir).resolve().name
@@ -309,8 +307,13 @@ def metric_cache_file_for_collection(route_dir, cache_dir):
     matches = []
     for manifest_path in manifest_paths:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if tuple(manifest["metric_names"]) != METRIC_NAMES:
-            raise ValueError("metric cache order does not match WoTE metric order")
+        if tuple(manifest["metric_names"]) != tuple(metric_names):
+            raise ValueError("metric cache schema mismatch in %s; rebuild labels for the selected reward scheme" % manifest_path)
+        if boundary_target_m is not None:
+            settings = manifest.get("boundary_label_settings", {})
+            if (settings.get("version") != BOUNDARY_LABEL_VERSION
+                    or settings.get("target_m") != boundary_target_m):
+                raise ValueError("boundary label settings mismatch in %s; rebuild the cache with the requested target" % manifest_path)
         entry = manifest["routes"].get(route_name)
         if entry is not None:
             matches.append(manifest_path.parent / entry["file"])
@@ -321,14 +324,15 @@ def metric_cache_file_for_collection(route_dir, cache_dir):
     return matches[0]
 
 
-def load_metric_cache_shard(path, expected_anchor_count=256):
+def load_metric_cache_shard(path, expected_anchor_count=256,
+                            metric_names=METRIC_NAMES):
     """Load and validate a route shard, including a frame-to-row lookup."""
     path = Path(path)
     with np.load(path, allow_pickle=False) as archive:
         frames = archive["frames"].astype(np.int32)
         targets = archive["metric_targets"].astype(np.float32)
         valid = archive["metric_valid"].astype(np.uint8)
-    expected = (len(frames), expected_anchor_count, len(METRIC_NAMES))
+    expected = (len(frames), expected_anchor_count, len(metric_names))
     if frames.ndim != 1 or targets.shape != expected or valid.shape != expected:
         raise ValueError("invalid metric cache shapes in %s" % path)
     if len(np.unique(frames)) != len(frames):

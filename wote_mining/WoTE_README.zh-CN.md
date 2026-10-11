@@ -53,9 +53,9 @@ CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run \
                                                │
                                   trajectory = anchor + offset
                                                │
-                                   世界模型②（仅在线推理）
+                             reward读取世界模型①的结果
                                                │
-                                         reward 一次
+                             按奖励选中的编号取最终轨迹
 ```
 
 这里的 `anchor + offset` 就是原版 WoTE 的轨迹生成方式，不是生成轨迹后的修正器。
@@ -79,14 +79,13 @@ offset loss、候选 imitation loss、固定 anchor 奖励标签和地图标签�
 
 训练标签对应固定的256条 anchor，因此训练和验证阶段的世界模型①、reward head
 和地图监督仍使用固定 anchors；融合后的 offset/scores 直接接受原版轨迹损失。
-CARLA 在线推理时，融合后生成的完整轨迹再进入世界模型②，最后只计算一次奖励。
+CARLA 默认 `WOTE_WORLD_PASSES=1`，复用世界模型①及其奖励排序，按选中的编号取
+最终解码轨迹。`WOTE_WORLD_PASSES=2` 可用于对照：将完整轨迹送入世界模型②后评分。
 
-用于构造变化条件的当前与未来 scene 都使用 `detach()`，因此原 WTA 和
-reward-topk 轨迹损失不会沿这条条件路径回传到世界模型或骨干。未来注意力、
-AdaLN、offset head 和当前 BEV 主路径仍接受轨迹梯度；动作注入后的未来 tokens
-继续通过原有语义地图与 reward 损失训练。这不是冻结世界模型或共享骨干，
-也没有增加融合前轨迹的辅助监督。模型参数结构不变，但融合语义已经改变，
-应使用新的输出目录从头训练并单独评估。
+当前参考 scene 使用 `detach()`；未来 scene 保持可微。因此 WTA 和 reward-topk
+轨迹损失可以经未来残差条件训练世界模型，参考项不会沿相减路径反传。
+未来注意力、AdaLN、offset head 和当前 BEV 主路径仍接受轨迹梯度；动作注入后的
+未来 tokens 继续通过语义地图与 reward 损失训练。
 
 ### Reward-topk 多候选轨迹监督（仅训练/验证）
 
@@ -102,7 +101,7 @@ AdaLN、offset head 和当前 BEV 主路径仍接受轨迹梯度；动作注入�
    取均值；没有合格额外候选时贡献零，不强行填入其他模式，也不降低原 WTA 权重。
 
 辅助回归会训练现有 offset head、未来注意力、AdaLN 及当前特征路径，
-不会经截断的未来 BEV 条件训练世界模型。不增加网络参数、修正器、
+也会经可微的未来 BEV 条件训练世界模型。不增加网络参数、修正器、
 奖励头或世界模型调用。原语义/奖励标签和损失不变；在线仍完整生成并评价256条候选，
 训练 top-k 不限制推理候选数量。训练时的 reward 依然评价固定 anchors，因此这里
 复用的是同一候选 ID 的奖励偏好，**不等同于在线世界模型②对完整轨迹的真实评分**。
@@ -152,15 +151,15 @@ bash wote_mining/WoTE_evaluate.sh
 卡住恢复机制。它在线评价256条候选，选择一条4秒轨迹，再输出转向、油门和制动。
 
 闭环的 `control_telemetry.jsonl` 额外记录 `reward_topk_candidates`：奖励最高的
-4条候选各自的排名、anchor编号、是否最终选中、总奖励、五项具名评分、完整
+4条候选各自的排名、anchor编号、是否最终选中、总奖励、具名评分、完整
 `[8,3]` 轨迹及 `learned_desired_speed_mps`。轨迹为车辆坐标系的
 `[x,y,yaw]`（米、米、弧度），速度按前两个轨迹点的XY间距乘2计算，与PID的
 原始目标速度定义一致，尚未经过坡度、安全停车或卡住恢复调整。奖励相同的候选
 优先列出实际选中的候选，再按编号排列。这些数据只用于分辨“没有生成合适轨迹”
 和“奖励没有选好轨迹”，不改变选轨迹、PID或训练损失。仅日志新增不需要重训；
-本次 future BEV detach 的训练影响则需要重训后评估。
+未来条件梯度和奖励定义的改动则需要重训后评估。
 
-离线标签顺序固定为 `NC、DAC、EP、TTC、Comfort`。需要重建标签时使用
+`source` 标签顺序为 `NC、DAC、EP、TTC、Comfort`。需要重建标签时使用
 `wote_mining/tools/WoTE_build_metric_cache.py`；其他资产重建与检查入口也都在
 `wote_mining/tools/` 中。
 
@@ -180,3 +179,77 @@ sigmoid 形式用于兼容矿山版可相互重叠的语义图层。
 是这份差值在全部候选之间的总体标准差。两者结合用于区分共享时间变化和候选相关
 变化，但不能单独证明未来信息带来了收益。这些
 字段均为无梯度监控量，不参与 `loss_total`，不会改变训练目标。
+
+## 道路边界裕度试验（mining_boundary）
+
+通过 `--reward-scheme mining_boundary` 启用，默认仍为 `source`，以免旧训练命令
+意外更换目标。保留模仿奖励，评价头变为 **NC、DAC、EP、road_boundary_margin**
+四个；不训练或使用 TTC/Comfort 头。AdaLN、Top-K、未来梯度和控制器沿用当前版本。
+
+车身尺寸沿用 9.3969 m × 5.3645 m，每 0.125 s 检查一个未来姿态，每个姿态取
+整个采样车身到非道路区域的最小距离 `c(t)`。未来标签为
+`clip(min_t(c(t)) / boundary_target_m, 0, 1)`：排除当前时刻，取未来最小车身间距。
+这样短暂贴边也会降低分数，避免被其他安全时刻稀释。标签版本为
+`future_footprint_saturated_min_v2`，旧的时间平均标签缓存必须重新生成。
+越界时刻的余量为零，地图外区域按未知掩码处理；原 DAC 包括当前时刻的定义不变。
+距离来自 0.2 m/像素栅格与 0.5 m 车身采样，是几何近似，不是连续空间安全保证。
+
+新评分为
+`0.1 log(p_im) + 0.5 log(p_NC) + 0.5 log(p_DAC) + log(1 + p_EP) + lambda * p_boundary`。
+前三个系数及 EP 系数仍由 `wote_reward_weights` 控制；EP=0 的分数有限，允许合法停车。
+`lambda` 默认试验值 0.2，边界只是有界偏好，不作为一票否决。这里的 EP 聚合也已
+变化，不能把完整方案的得分差异全部归因于新边界标签。四头 BCE 各自归一化后相加，
+与旧五头的总损失不能直接横向比较。
+
+**阈值是试验设置，不是矿车安全标准。** `0.6 m` 暂时保留，不为制造差异放大。
+2026-10-12 检查训练集120条采集路线，每条按旧DAC失败比例选2个边缘约束较强帧，
+共240张地图、44996条道路合规候选；这属于偏向边缘的抽样，不代表全数据发生率。
+在0.6 m设置下，时间平均评分的场景内标准差均值为0.00653，未来最小间距评分
+为0.09311；4.12%的合规候选进入非满分区间，合规专家均满分。
+实际例子中最低间距约0.12 m，平均分约0.94，而最小间距评分约0.21。
+道路标签来自OpenDRIVE道路栅格，不是实体路肩/边坡真值。已有闭环遥测缺少连续
+车辆位姿，不能据此完成真实横向跟踪误差标定；仍需后续仿真验证安全间距。
+CPU几何、缓存及梯度测试不替代服务器上使用真实batch的GPU短跑。
+
+只读抽样（不生成报告、不改数据）：
+
+```bash
+python wote_mining/tools/WoTE_probe_boundary_labels.py \
+  --data-root /path/to/raw \
+  --cache-dir wote_mining/assets/metric_cache \
+  --split train --max-routes 20 --frames-per-route 3
+```
+
+对边缘约束较强帧比较时间平均与最小间距（只读原数据，预览写入指定临时目录）：
+
+```bash
+python wote_mining/tools/WoTE_probe_boundary_labels.py \
+  --data-root /path/to/raw --cache-dir wote_mining/assets/metric_cache \
+  --split train --max-routes 120 --frames-per-route 2 --frame-selection edge \
+  --target-m 0.6 --preview-dir /tmp/wote-boundary-preview
+```
+
+确定阈值后，分别生成新的 train/val 缓存，不覆盖原缓存。以0.6 m演示命令：
+
+```bash
+for split in train val; do
+  python wote_mining/tools/WoTE_build_metric_cache.py \
+    --data-root /path/to/raw \
+    --assignments leaderboard/data/mining/split_v2/split_assignments.csv \
+    --anchors wote_mining/assets/anchors/trajectory_anchors_256.npy \
+    --routes-dir wote_mining/assets/routes \
+    --output-dir "wote_mining/assets/metric_cache_boundary/$split" \
+    --split "$split" --reward-scheme mining_boundary \
+    --boundary-target-m 0.6 --workers 4
+done
+```
+
+在原训练命令中附加 `--reward-scheme mining_boundary --boundary-target-m 0.6
+--boundary-reward-weight 0.2`，使用新的训练输出目录。缓存默认定位到
+`assets/metric_cache_boundary`，也可指定 `--metric-cache-dir`。旧缓存名称、阈值或
+anchor哈希不匹配时会明确报错；不允许从旧五头checkpoint直接resume为四头。
+新checkpoint及args.json保存奖励定义，旧checkpoint没有该字段时按source恢复。
+推理仍仅使用传感器与学习的Reward，不查询真实道路地图。
+
+缓存生成和TensorBoard记录边界标签均值、预测MAE，以及道路合规候选内的标签
+标准差，后者用于确认新指标是否真的能区分DAC已经通过的候选。

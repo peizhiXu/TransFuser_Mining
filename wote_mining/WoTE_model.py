@@ -388,23 +388,25 @@ from torch import nn
 from torch.nn import functional as F
 
 
-METRIC_NAMES = (
-    "no_collision",
-    "drivable_compliance",
-    "ego_progress",
-    "time_to_collision",
-    "comfort",
+from wote_mining.WoTE_reward_schema import (
+    SOURCE_METRIC_NAMES as METRIC_NAMES, metric_names_for_scheme,
+    validate_boundary_settings,
 )
 
 
 class WoTEMiningRewardHead(nn.Module):
     """Score [B,K] candidates from current/future BEV and action features."""
 
-    def __init__(self, hidden_dim=256, weights=(0.1, 0.5, 0.5, 1.0)):
+    def __init__(self, hidden_dim=256, weights=(0.1, 0.5, 0.5, 1.0),
+                 reward_scheme="source", boundary_reward_weight=0.2):
         super().__init__()
         if len(weights) != 4 or any(weight < 0 for weight in weights):
             raise ValueError("reward weights must contain four nonnegative values")
         self.hidden_dim = hidden_dim
+        self.reward_scheme = reward_scheme
+        self.metric_names = metric_names_for_scheme(reward_scheme)
+        validate_boundary_settings(0.6, boundary_reward_weight)
+        self.boundary_reward_weight = float(boundary_reward_weight)
         self.register_buffer("weights", torch.tensor(weights, dtype=torch.float32))
         self.reward_conv = nn.Sequential(
             nn.Conv2d(2 * hidden_dim, hidden_dim, 3, padding=1),
@@ -422,7 +424,7 @@ class WoTEMiningRewardHead(nn.Module):
         )
         self.metric_heads = nn.ModuleList([
             nn.Sequential(nn.Linear(hidden_dim, 128), nn.ReLU(), nn.Linear(128, 1))
-            for _ in METRIC_NAMES
+            for _ in self.metric_names
         ])
 
     def forward(self, current_bev, future_bev, current_action, future_action):
@@ -460,18 +462,20 @@ class WoTEMiningRewardHead(nn.Module):
             "metric_logits": metric_logits,
             "metric_scores": metric_scores,
             "final_rewards": final_rewards,
+            "metric_names": self.metric_names,
         }
 
     def compose_rewards(self, imitation_logits, metric_logits):
-        """Use WoTE's four-term reward composition with stable logarithms.
+        """Compose either legacy five-metric or mining boundary rewards.
 
-        Metric order: no collision, drivable compliance, progress, TTC,
-        comfort. A higher final reward is better.
+        The source schema retains its exact formula. Mining uses imitation,
+        NC, DAC, log(1+EP), and a bounded boundary bonus; TTC/Comfort heads
+        do not exist in that schema. A higher final reward is better.
         """
         if imitation_logits.ndim != 2 or metric_logits.shape != (
-            imitation_logits.shape[0], imitation_logits.shape[1], 5
+            imitation_logits.shape[0], imitation_logits.shape[1], len(self.metric_names)
         ):
-            raise ValueError("expected imitation [B,K] and metrics [B,K,5]")
+            raise ValueError("reward logits do not match the selected metric schema")
         if imitation_logits.shape[1] < 1:
             raise ValueError("at least one candidate is required")
         metric_scores = torch.sigmoid(metric_logits)
@@ -481,6 +485,16 @@ class WoTEMiningRewardHead(nn.Module):
         log_no_collision = F.logsigmoid(metric_logits[..., 0])
         log_drivable = F.logsigmoid(metric_logits[..., 1])
         progress = metric_scores[..., 2]
+        w = self.weights.to(dtype=imitation_logits.dtype)
+        if self.reward_scheme == "mining_boundary":
+            # Bounded progress allows legitimate stops (EP=0 is finite).
+            # Boundary is a soft bounded bonus, never a logarithmic barrier.
+            final_rewards = (
+                w[0] * log_imitation + w[1] * log_no_collision
+                + w[2] * log_drivable + w[3] * torch.log1p(progress)
+                + self.boundary_reward_weight * metric_scores[..., 3]
+            )
+            return final_rewards, log_imitation.exp(), metric_scores
         ttc = metric_scores[..., 3]
         comfort = metric_scores[..., 4]
         combined = (5.0 * ttc + 2.0 * comfort + 5.0 * progress).clamp_min(1e-8)
@@ -912,7 +926,9 @@ class WoTEMiningPlanner(nn.Module):
             lidar_x=backbone.config.lidar_pos[0]
         )
         self.reward_head = WoTEMiningRewardHead(
-            weights=getattr(backbone.config, "wote_reward_weights", (0.1, 0.5, 0.5, 1.0))
+            weights=getattr(backbone.config, "wote_reward_weights", (0.1, 0.5, 0.5, 1.0)),
+            reward_scheme=getattr(backbone.config, "wote_reward_scheme", "source"),
+            boundary_reward_weight=getattr(backbone.config, "wote_boundary_reward_weight", 0.2),
         )
         self.current_agent_head = WoTEMiningAgentHead(
             lidar_x=backbone.config.lidar_pos[0]

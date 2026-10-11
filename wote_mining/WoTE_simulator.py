@@ -25,6 +25,7 @@ def evaluate_road_compliance(
     margin_m=0.0,
     footprint_spacing_m=0.5,
     samples_per_interval=4,
+    boundary_target_m=0.6,
 ):
     """Score K 4-second trajectories against the current 100 m x 100 m map.
 
@@ -53,6 +54,8 @@ def evaluate_road_compliance(
         raise ValueError("vehicle dimensions must be positive and margin nonnegative")
     if footprint_spacing_m <= 0 or samples_per_interval < 1:
         raise ValueError("footprint spacing and temporal sampling must be positive")
+    if not np.isfinite(boundary_target_m) or boundary_target_m <= 0:
+        raise ValueError("boundary target clearance must be finite and positive")
 
     # Include the current pose and interpolate between all eight 0.5 s poses.
     start = np.concatenate(
@@ -122,6 +125,16 @@ def evaluate_road_compliance(
 
     valid = (sampled != 2).all(axis=1)
     compliant = (sampled == 1).all(axis=1)
+    # Keep source DAC (including t=0) intact. The new soft preference uses
+    # future poses ONLY, otherwise a shared close-to-edge start locks every
+    # candidate's minimum clearance to the same value. Use the worst FUTURE
+    # pose: a short close approach must not be diluted by many safe poses.
+    per_pose_road = sampled.reshape(poses.shape[0], 1 + 8 * samples_per_interval, -1)
+    per_pose_clearance = clearance.reshape(per_pose_road.shape).min(axis=-1)
+    per_pose_clearance = np.where((per_pose_road == 1).all(axis=-1), per_pose_clearance, 0.0)
+    future_clearance = per_pose_clearance[:, 1:]
+    boundary_valid = (per_pose_road[:, 1:] != 2).all(axis=(1, 2))
+    boundary_score = np.clip(future_clearance.min(axis=1) / boundary_target_m, 0.0, 1.0)
     return {
         "drivable_compliance": compliant.astype(np.float32),
         "drivable_valid": valid.astype(np.uint8),
@@ -131,6 +144,9 @@ def evaluate_road_compliance(
             valid, clearance.min(axis=1), np.nan
         ).astype(np.float32),
         "sample_count": int(sampled.shape[1]),
+        "future_road_clearance_m": future_clearance.astype(np.float32),
+        "road_boundary_margin": np.where(boundary_valid, boundary_score, 0.0).astype(np.float32),
+        "road_boundary_valid": boundary_valid.astype(np.uint8),
     }
 
 
@@ -765,7 +781,8 @@ import numpy as np
 
 def evaluate_mining_candidates(trajectories, road_map, route_xy,
                                recorded_tracks=None,
-                               augmentation_degrees=0.0):
+                               augmentation_degrees=0.0,
+                               reward_scheme="source", boundary_target_m=0.6):
     """Evaluate candidates without inventing unavailable WoTE labels.
 
     DAC and EP use map/route labels. NC and TTC are activated only where the
@@ -775,6 +792,7 @@ def evaluate_mining_candidates(trajectories, road_map, route_xy,
     road = evaluate_road_compliance(
         trajectories, road_map,
         augmentation_degrees=augmentation_degrees,
+        boundary_target_m=boundary_target_m,
     )
     route = evaluate_route_progress(
         trajectories, route_xy, required_lookahead_m=30.0,
@@ -821,6 +839,13 @@ def evaluate_mining_candidates(trajectories, road_map, route_xy,
         raise AssertionError("candidate metric target masks overlap")
     targets = targets + comfort_targets
     mask = mask | comfort_mask
+    from wote_mining.WoTE_reward_schema import metric_names_for_scheme
+    metric_names_for_scheme(reward_scheme)
+    if reward_scheme == "mining_boundary":
+        # No relabelling of the old TTC/Comfort slots: a new named schema
+        # forces cache/checkpoint consumers to acknowledge the changed task.
+        targets = np.concatenate((targets[:, :3], road["road_boundary_margin"][:, None]), axis=1)
+        mask = np.concatenate((mask[:, :3], road["road_boundary_valid"][:, None]), axis=1)
     result = {
         "metric_targets": targets,
         "metric_valid": mask,

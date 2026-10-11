@@ -24,6 +24,11 @@ class WoTEMiningConfig(GlobalConfig):
     num_traj_anchors = 256
     wote_hidden_dim = 256
     wote_reward_weights = (0.1, 0.5, 0.5, 1.0)
+    # Preserve existing runs; explicitly opt into the four-head experiment
+    # with --reward-scheme mining_boundary after checking label statistics.
+    wote_reward_scheme = "source"
+    wote_boundary_target_m = 0.6  # pilot setting, to be checked on train labels
+    wote_boundary_reward_weight = 0.2  # bounded, soft preference (not a veto)
     # Source WoTE training defaults (configs/default.py).
     wote_num_future_map_candidates = 1
     wote_traj_offset_loss_weight = 1.0

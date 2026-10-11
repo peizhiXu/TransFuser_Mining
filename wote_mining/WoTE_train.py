@@ -6,6 +6,7 @@ TransFuser checkout without adding NAVSIM/Hydra/Lightning dependencies.
 """
 
 import math
+import hashlib
 import sys
 from pathlib import Path
 
@@ -22,6 +23,10 @@ from wote_mining.WoTE_loss import (
     source_style_core_losses,
 )
 from wote_mining.WoTE_model import METRIC_NAMES, current_semantic_map_loss
+from wote_mining.WoTE_reward_schema import (
+    REWARD_SCHEMES, BOUNDARY_LABEL_VERSION, metric_names_for_scheme, validate_boundary_settings,
+    reward_settings, restore_reward_settings,
+)
 
 
 class WoTEMiningTrainingModule(nn.Module):
@@ -136,9 +141,10 @@ class WoTEMiningTrainingModule(nn.Module):
     def compute_diagnostics(self, batch, outputs):
         """Return detached training diagnostics which never enter loss_total."""
         logits = outputs["metric_logits"].float()
+        metric_names = outputs.get("metric_names", METRIC_NAMES)
         targets = batch["wote_metric_targets"].to(logits).float()
         valid = batch["wote_metric_valid"].to(logits).float()
-        if logits.shape != targets.shape or logits.shape[-1] != len(METRIC_NAMES):
+        if logits.shape != targets.shape or logits.shape[-1] != len(metric_names):
             raise ValueError("metric diagnostic tensors have incompatible shapes")
         if valid.shape != targets.shape:
             raise ValueError("metric diagnostic validity has incompatible shape")
@@ -150,7 +156,7 @@ class WoTEMiningTrainingModule(nn.Module):
         elementwise_mae = (probabilities - targets).abs()
         diagnostics = {}
         diagnostic_weights = {}
-        for metric_index, metric_name in enumerate(METRIC_NAMES):
+        for metric_index, metric_name in enumerate(metric_names):
             metric_valid = valid[..., metric_index]
             valid_count = metric_valid.sum()
             denominator = valid_count.clamp_min(1.0)
@@ -173,6 +179,17 @@ class WoTEMiningTrainingModule(nn.Module):
             diagnostic_weights[prefix + "_valid_fraction"] = valid_count.new_tensor(
                 metric_valid.numel()
             )
+        if "road_boundary_margin" in metric_names:
+            index = metric_names.index("road_boundary_margin")
+            # Monitor genuine within-road discrimination, not just DAC fails.
+            eligible = (valid[..., index] > 0) & (valid[..., 1] > 0) & (targets[..., 1] > 0.5)
+            counts = eligible.sum(dim=1)
+            mean = (targets[..., index] * eligible).sum(dim=1) / counts.clamp_min(1)
+            variance = ((targets[..., index] - mean[:, None]).square() * eligible).sum(dim=1) / counts.clamp_min(1)
+            usable = counts >= 2
+            key = "boundary_compliant_candidate_target_std"
+            diagnostics[key] = (variance.sqrt() * usable).sum() / usable.sum().clamp_min(1)
+            diagnostic_weights[key] = usable.sum()
 
         future = batch["wote_future_poses"].to(outputs["trajectories"]).float()
         anchors = outputs["anchors"]
@@ -359,6 +376,13 @@ def parse_args():
     parser.add_argument("--use-velocity", action="store_true")
     parser.add_argument("--no-target-point-image", action="store_true")
     parser.add_argument("--future-map-candidates", type=int, default=1)
+    parser.add_argument("--reward-scheme", choices=REWARD_SCHEMES, default=WoTEMiningConfig.wote_reward_scheme)
+    parser.add_argument("--boundary-target-m", type=float, default=0.6,
+                        help="saturation clearance in meters; must match cache manifest")
+    parser.add_argument("--boundary-reward-weight", type=float, default=0.2,
+                        help="bounded soft boundary bonus; 0 disables its selection effect")
+    parser.add_argument("--metric-cache-dir", default=None,
+                        help="cache root containing train/val manifests for this reward scheme")
     parser.add_argument(
         "--reward-topk", type=int, default=WoTEMiningConfig.wote_reward_topk,
         help="maximum extra expert-compatible candidates to supervise (0 disables)",
@@ -462,6 +486,26 @@ def move_batch(batch, device):
         if torch.is_tensor(value) else value
         for key, value in batch.items()
     }
+
+
+def validate_reward_cache(config, anchors_path):
+    """Reject mismatched labels before model construction/pretrained download."""
+    expected_names = metric_names_for_scheme(config.wote_reward_scheme)
+    anchors_hash = hashlib.sha256(Path(anchors_path).read_bytes()).hexdigest()
+    for split in ("train", "val"):
+        path = Path(config.wote_metric_cache_dir) / split / "manifest.json"
+        if not path.is_file():
+            raise FileNotFoundError("reward cache missing: %s; generate train/val labels for --reward-scheme %s first" % (path, config.wote_reward_scheme))
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        if tuple(manifest["metric_names"]) != expected_names:
+            raise ValueError("reward cache schema mismatch: %s" % path)
+        if manifest.get("anchors_sha256") != anchors_hash:
+            raise ValueError("reward cache anchors differ from training anchors: %s" % path)
+        if config.wote_reward_scheme == "mining_boundary":
+            settings = manifest.get("boundary_label_settings", {})
+            if (settings.get("version") != BOUNDARY_LABEL_VERSION
+                    or settings.get("target_m") != config.wote_boundary_target_m):
+                raise ValueError("boundary cache definition/threshold mismatch: %s" % path)
 
 
 def reduce_loss_sums(loss_sums, batches, device, distributed):
@@ -613,6 +657,8 @@ def save_checkpoint(path, model, optimizer, scaler, epoch, args, config,
         "args": vars(args),
         "config": {
             "reward_weights": tuple(config.wote_reward_weights),
+            "reward_scheme_settings": reward_settings(config),
+            "metric_names": metric_names_for_scheme(getattr(config, "wote_reward_scheme", "source")),
             "loss_weights": {
                 name: getattr(config, name) for name in (
                     "wote_traj_offset_loss_weight",
@@ -674,6 +720,9 @@ def backfill_tensorboard(writer, metrics_path, before_epoch):
 
 def main():
     args = parse_args()
+    if args.reward_scheme == "mining_boundary":
+        args.boundary_label_version = BOUNDARY_LABEL_VERSION
+    validate_boundary_settings(args.boundary_target_m, args.boundary_reward_weight)
     if args.save_every < 0:
         raise ValueError("--save-every must be non-negative")
     if not 0 <= args.reward_topk < WoTEMiningConfig.num_traj_anchors:
@@ -694,6 +743,13 @@ def main():
     config = WoTEMiningConfig(
         root_dir=args.root_dir, setting=("mining" if prepared else "eval")
     )
+    config.wote_reward_scheme = args.reward_scheme
+    config.wote_boundary_target_m = args.boundary_target_m
+    config.wote_boundary_reward_weight = args.boundary_reward_weight
+    if args.metric_cache_dir:
+        config.wote_metric_cache_dir = args.metric_cache_dir
+    elif args.reward_scheme == "mining_boundary":
+        config.wote_metric_cache_dir = str(ROOT / "wote_mining/assets/metric_cache_boundary")
     if not prepared:
         cache_root = Path(config.wote_metric_cache_dir)
         config.train_data = route_dirs_from_manifest(
@@ -723,6 +779,7 @@ def main():
         raise FileNotFoundError("trajectory anchors not found: %s" % args.anchors)
     if config.augment:
         raise ValueError("cached WoTE metric labels require config.augment=False")
+    validate_reward_cache(config, args.anchors)
 
     backbone = TransfuserBackbone(
         config,
@@ -739,6 +796,13 @@ def main():
     best_val_loss = float("inf")
     if args.resume:
         checkpoint = torch.load(args.resume, map_location=device)
+        previous_reward_config = WoTEMiningConfig(setting="eval")
+        restore_reward_settings(previous_reward_config, checkpoint.get("args", {}), checkpoint.get("config", {}))
+        previous_reward = reward_settings(previous_reward_config)
+        current_reward = reward_settings(config)
+        if (previous_reward["scheme"] != current_reward["scheme"]
+                or (current_reward["scheme"] == "mining_boundary" and previous_reward != current_reward)):
+            raise ValueError("cannot resume with a changed reward schema/label definition; start a new training run")
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         if "scaler" in checkpoint:
@@ -827,6 +891,10 @@ def main():
             config.wote_reward_topk, config.wote_reward_topk_loss_weight,
             config.wote_reward_topk_ade_max_m,
             config.wote_reward_topk_endpoint_max_m,
+        ))
+        print("reward_scheme=%s metrics=%s boundary_target=%.2fm boundary_weight=%.3f" % (
+            config.wote_reward_scheme, metric_names_for_scheme(config.wote_reward_scheme),
+            config.wote_boundary_target_m, config.wote_boundary_reward_weight,
         ))
 
     for epoch in range(start_epoch, args.epochs):

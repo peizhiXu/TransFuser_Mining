@@ -236,7 +236,7 @@ class WoTEMiningInferenceModel(nn.Module):
             ),
             "metric rewards:",
         ]
-        for name, value in zip(METRIC_NAMES, metrics):
+        for name, value in zip(diagnostics.get("metric_names", METRIC_NAMES), metrics):
             lines.append("  %-21s %.4f" % (name, value))
         for line_index, line in enumerate(lines):
             color = (90, 220, 255) if line_index == 0 else (235, 235, 235)
@@ -294,6 +294,8 @@ class WoTEMiningInferenceModel(nn.Module):
                 outputs["selected_anchor_index"][0].detach().cpu()
             ),
             "selected_reward": float(selected_rewards[0].detach().cpu()),
+            "metric_names": list(outputs.get("metric_names", METRIC_NAMES)),
+            "reward_scheme": getattr(self.config, "wote_reward_scheme", "source"),
             "selected_metric_scores": [
                 float(value) for value in selected_metrics[0].detach().cpu()
             ],
@@ -347,6 +349,8 @@ class WoTEMiningAgent(HybridAgent):
         if self.config.use_point_pillars:
             raise ValueError('WoTE mining Agent currently requires histogram LiDAR BEV')
         self.config.multitask = False
+        from wote_mining.WoTE_reward_schema import restore_reward_settings
+        restore_reward_settings(self.config, self.args)
 
     def setup(self, path_to_conf_file, route_index=None):
         super().setup(path_to_conf_file, route_index=route_index)
@@ -396,6 +400,13 @@ class WoTEMiningAgent(HybridAgent):
     def _checkpoint_state_dict(self, checkpoint):
         if not isinstance(checkpoint, dict) or 'model' not in checkpoint:
             raise ValueError('WoTE checkpoint must contain a model state_dict')
+        from wote_mining.WoTE_reward_schema import restore_reward_settings, reward_settings
+        saved_config = WoTEMiningConfig(setting='eval')
+        restore_reward_settings(saved_config, checkpoint.get('args', {}), checkpoint.get('config', {}))
+        expected, actual = reward_settings(self.config), reward_settings(saved_config)
+        if (expected['scheme'] != actual['scheme']
+                or (actual['scheme'] == 'mining_boundary' and expected != actual)):
+            raise ValueError('args.json and checkpoint reward settings disagree; copy args.json from the same training run')
         return checkpoint['model']
 
     def _strict_checkpoint_loading(self):

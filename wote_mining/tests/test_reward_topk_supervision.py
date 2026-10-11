@@ -220,10 +220,11 @@ class TrainingIntegrationTests(unittest.TestCase):
     def tearDownClass(cls):
         torch.set_num_threads(cls.previous_threads)
 
-    def make_training_module(self, loss_weight=0.25):
+    def make_training_module(self, loss_weight=0.25, reward_scheme='source'):
         config = self.config_type(setting='eval')
         config.use_target_point_image = True
         config.wote_reward_topk_loss_weight = loss_weight
+        config.wote_reward_scheme = reward_scheme
 
         class SyntheticBackbone(nn.Module):
             def __init__(self):
@@ -248,8 +249,8 @@ class TrainingIntegrationTests(unittest.TestCase):
             speed=torch.ones(1, 1), target_point=torch.tensor([[10., 0.]]),
             wote_future_poses=torch.from_numpy(anchors[:1].copy()),
             wote_augmentation_degrees=torch.zeros(1),
-            wote_metric_targets=torch.full((1, 8, 5), 0.5),
-            wote_metric_valid=torch.ones(1, 8, 5),
+            wote_metric_targets=torch.full((1, 8, len(planner.reward_head.metric_names)), 0.5),
+            wote_metric_valid=torch.ones(1, 8, len(planner.reward_head.metric_names)),
             wote_current_scene=torch.zeros(1, 4, 160, 160),
             wote_current_valid=torch.ones(1, 160, 160),
             wote_current_agent_boxes=torch.zeros(1, 20, 5),
@@ -258,6 +259,26 @@ class TrainingIntegrationTests(unittest.TestCase):
             wote_future_valid=torch.ones(1, 160, 160),
         )
         return module, batch
+
+    def test_boundary_training_graph_uses_four_heads_and_trains_world_model(self):
+        module, batch = self.make_training_module(reward_scheme='mining_boundary')
+        module.eval()
+        outputs = module(batch)
+        self.assertEqual(outputs['metric_names'],
+                         ('no_collision', 'drivable_compliance', 'ego_progress', 'road_boundary_margin'))
+        self.assertEqual(outputs['metric_logits'].shape, (1, 8, 4))
+        self.assertEqual(len(module.planner.reward_head.metric_heads), 4)
+        losses = module.compute_losses(batch, outputs)
+        diagnostics, _ = module.compute_diagnostics(batch, outputs)
+        self.assertIn('metric_road_boundary_margin_mae', diagnostics)
+        self.assertNotIn('metric_comfort_mae', diagnostics)
+        self.assertNotIn('metric_time_to_collision_mae', diagnostics)
+        outputs['future_bev_tokens'].retain_grad()
+        losses['loss_total'].backward()
+        self.assertGreater(outputs['future_bev_tokens'].grad.abs().sum().item(), 0.)
+        self.assertGreater(module.planner.reward_head.metric_heads[3][-1].weight.grad.abs().sum().item(), 0.)
+        self.assertEqual([name for name, param in module.named_parameters()
+                          if param.requires_grad and param.grad is None], [])
 
     def test_full_training_graph_loss_diagnostics_and_all_parameters_backward(self):
         module, batch = self.make_training_module()
@@ -364,6 +385,23 @@ class TrainingIntegrationTests(unittest.TestCase):
         self.assertEqual(checkpoint['config']['loss_weights']['wote_reward_topk_loss_weight'], 0.25)
         self.assertFalse(any('topk' in name for name in checkpoint['model']))
         module.load_state_dict(checkpoint['model'], strict=True)
+
+    def test_boundary_checkpoint_saves_schema_and_inference_restores_it(self):
+        from wote_mining.WoTE_train import save_checkpoint
+        from wote_mining.WoTE_reward_schema import restore_reward_settings
+        module, _ = self.make_training_module(reward_scheme='mining_boundary')
+        optimizer = torch.optim.AdamW(module.parameters())
+        scaler = torch.cuda.amp.GradScaler(enabled=False)
+        with tempfile.TemporaryDirectory(prefix='wote-boundary-checkpoint-') as directory:
+            path = Path(directory)/'checkpoint.pth'
+            save_checkpoint(path, module, optimizer, scaler, 0, SimpleNamespace(), module.config, 1.)
+            checkpoint = torch.load(path, map_location='cpu')
+        config = self.config_type(setting='eval')
+        restore_reward_settings(config, checkpoint['args'], checkpoint['config'])
+        self.assertEqual(config.wote_reward_scheme, 'mining_boundary')
+        self.assertEqual(tuple(checkpoint['config']['metric_names']), module.planner.reward_head.metric_names)
+        restored, _ = self.make_training_module(reward_scheme=config.wote_reward_scheme)
+        restored.load_state_dict(checkpoint['model'], strict=True)
 
     def test_cli_defaults_and_overrides(self):
         from wote_mining.WoTE_train import parse_args
