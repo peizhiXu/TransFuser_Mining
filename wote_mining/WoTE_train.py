@@ -498,6 +498,28 @@ def reduce_weighted_sums(value_sums, weight_sums, device, distributed):
     return result
 
 
+def require_finite_tensors(tensors, context, distributed=False):
+    """Stop all ranks together before invalid predictions reach matching.
+
+    Inspect detached values only; this check does not change the training graph.
+    """
+    names = sorted(tensors)
+    if not names:
+        return
+    flags = torch.stack([
+        (~torch.isfinite(tensors[name].detach()).all()).to(torch.int32)
+        for name in names
+    ])
+    if distributed:
+        dist.all_reduce(flags, op=dist.ReduceOp.MAX)
+    invalid = [name for name, flag in zip(names, flags.cpu().tolist()) if flag]
+    if invalid:
+        raise FloatingPointError(
+            "%s: non-finite tensors on at least one rank: %s"
+            % (context, ", ".join(invalid))
+        )
+
+
 def run_epoch(model, loader, optimizer, scaler, device, config, epoch,
               training, distributed, rank, max_batches, grad_clip):
     model.train(training)
@@ -524,8 +546,23 @@ def run_epoch(model, loader, optimizer, scaler, device, config, epoch,
                 enabled=bool(config.wote_amp and device.type == "cuda")
             ):
                 outputs = model(batch)
+                numeric_context = "epoch=%d phase=%s batch=%d" % (
+                    epoch + 1, "train" if training else "val", batch_index + 1,
+                )
+                probe_names = (
+                    "bev_tokens", "current_agent_boxes_pred", "current_agent_logits",
+                    "future_delta_features", "future_scale_magnitude",
+                    "future_shift_magnitude", "future_gate_magnitude",
+                    "future_residual_magnitude", "offsets", "scores",
+                    "imitation_logits", "metric_logits", "current_map_logits",
+                    "future_map_logits",
+                )
+                probes = {name: outputs[name] for name in probe_names if name in outputs}
+                probes["target_current_agent_boxes"] = batch["wote_current_agent_boxes"]
+                require_finite_tensors(probes, numeric_context + " forward", distributed)
                 module = model.module if isinstance(model, DistributedDataParallel) else model
                 losses = module.compute_losses(batch, outputs)
+                require_finite_tensors(losses, numeric_context + " loss", distributed)
                 total = losses["loss_total"]
             diagnostics, diagnostic_weights = module.compute_diagnostics(batch, outputs)
             if training:

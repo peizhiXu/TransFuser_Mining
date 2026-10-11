@@ -19,6 +19,33 @@ from wote_mining.WoTE_loss import (
 )
 
 
+class NumericGuardTests(unittest.TestCase):
+    def test_finite_check_preserves_gradients(self):
+        from wote_mining.WoTE_train import require_finite_tensors
+        value = torch.tensor([2.0], requires_grad=True)
+        require_finite_tensors({'prediction': value}, 'test')
+        value.square().sum().backward()
+        self.assertEqual(value.grad.item(), 4.0)
+
+    def test_reports_nan_and_infinity_before_matching(self):
+        from wote_mining.WoTE_train import require_finite_tensors
+        for invalid in (float('nan'), float('inf')):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(FloatingPointError, 'batch=3.*boxes'):
+                    require_finite_tensors({
+                        'boxes': torch.tensor([invalid]),
+                        'other': torch.ones(1),
+                    }, 'epoch=10 batch=3')
+
+    def test_distributed_failure_is_propagated_to_finite_rank(self):
+        from wote_mining.WoTE_train import require_finite_tensors
+        def remote_failure(flags, op):
+            flags[0] = 1
+        with patch('wote_mining.WoTE_train.dist.all_reduce', side_effect=remote_failure):
+            with self.assertRaisesRegex(FloatingPointError, 'prediction'):
+                require_finite_tensors({'prediction': torch.ones(1)}, 'test', True)
+
+
 class RewardTopKSelectionTests(unittest.TestCase):
     def setUp(self):
         self.future = torch.zeros(1, 8, 3)
@@ -271,7 +298,7 @@ class TrainingIntegrationTests(unittest.TestCase):
         self.assertEqual(online['trajectories'].shape, (1, 8, 8, 3))
         self.assertTrue(torch.equal(online['world_trajectories'], online['trajectories']))
 
-    def test_trajectory_losses_train_future_condition_and_fusion(self):
+    def test_trajectory_losses_train_future_but_detach_current_reference(self):
         for loss_name in ('loss_traj_offset', 'loss_reward_topk_traj'):
             with self.subTest(loss=loss_name):
                 torch.manual_seed(7)
@@ -296,7 +323,7 @@ class TrainingIntegrationTests(unittest.TestCase):
                 losses[loss_name].backward()
                 self.assertIsNone(future.grad)
                 self.assertGreater(future_scene.grad.abs().sum().item(), 0.)
-                self.assertGreater(current_scene.grad.abs().sum().item(), 0.)
+                self.assertIsNone(current_scene.grad)
                 world_gradient = sum(
                     parameter.grad.abs().sum().item()
                     for parameter in module.planner.world_model.parameters()
@@ -414,7 +441,7 @@ class AdaLNGradientTests(unittest.TestCase):
                 self.assertGreater(layer.weight.grad.abs().sum().item(), 0.)
             self.assertGreater(head.future_bev_attention.in_proj_weight.grad.abs().sum().item(), 0.)
             self.assertGreater(future.grad.abs().sum().item(), 0.)
-            self.assertGreater(current_scene.grad.abs().sum().item(), 0.)
+            self.assertIsNone(current_scene.grad)
             self.assertIsNone(rewards.grad)
         finally:
             torch.set_num_threads(previous_threads)
