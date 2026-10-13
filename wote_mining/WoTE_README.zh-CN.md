@@ -253,3 +253,56 @@ anchor哈希不匹配时会明确报错；不允许从旧五头checkpoint直接r
 
 缓存生成和TensorBoard记录边界标签均值、预测MAE，以及道路合规候选内的标签
 标准差，后者用于确认新指标是否真的能区分DAC已经通过的候选。
+
+## 矿区奖励 + TTC 对照（独立分支）
+
+分支：`future-bev-residual-mining-reward-ttc`。通过
+`--reward-scheme mining_boundary_ttc` 显式启用；不改变 source 或
+mining_boundary 的原有含义。指标顺序为 NC、DAC、EP、边缘裕度、TTC，
+加上独立的模仿评分。Comfort 不参与此配置。
+
+新增项采用 `--ttc-reward-weight 0.2` 的有界软奖励：
+
+```text
+R_new = R_mining_boundary + 0.2 * sigmoid(TTC_logit)
+```
+
+原有奖励项、边缘阈值0.6m、Top-K=4/权重0.25、AdaLN、未来梯度反传、
+单次世界模型推理都不改变。TTC权重0.2是对照实验设置，不是行业标准。
+TTC head独立接受已有有效性掩码下的BCE监督；指标损失仍逐头平均后相加，
+因此新增头不会缩小原有四项监督的权重。
+
+TTC沿用本项目已有的记录车辆检查：在候选的未来采样位姿处，按自车瞬时
+速度/朝向外推最多1秒，与对应未来时刻的记录车辆车身检查重叠。标签是
+二值“通过/不通过TTC检查”，不是连续的剩余碰撞时间，也不是反应式交通仿真。
+记录覆盖不足时保留无效掩码，不能把未知状态作为安全标签。
+
+先生成独立缓存（不覆盖旧缓存）：
+
+```bash
+for reward_split in train val; do
+  python wote_mining/tools/WoTE_build_metric_cache.py \
+    --data-root /home/kemove/xpz/datasets/mining_dataset_hd465/raw \
+    --assignments leaderboard/data/mining/split_v2/split_assignments.csv \
+    --anchors wote_mining/assets/anchors/trajectory_anchors_256.npy \
+    --routes-dir wote_mining/assets/routes \
+    --output-dir "wote_mining/assets/metric_cache_boundary_ttc/${reward_split}" \
+    --split "$reward_split" --reward-scheme mining_boundary_ttc \
+    --boundary-target-m 0.6 --workers 4 || break
+done
+```
+
+再在原训练命令中使用 `--reward-scheme mining_boundary_ttc`，并设置新的
+训练输出目录。默认缓存定位到 `assets/metric_cache_boundary_ttc`，默认
+TTC奖励权重为0.2。从头训练，不从旧四指标权重resume；checkpoint与args.json
+保存新schema、边缘定义、TTC标签版本和权重。训练预检要求train/val都有有效
+TTC标签；日志/TensorBoard及闭环候选诊断分别记录边缘裕度与TTC，不混用名字。
+
+CPU检查：
+
+```bash
+OMP_NUM_THREADS=1 python -m unittest \
+  wote_mining.tests.test_boundary_ttc_reward \
+  wote_mining.tests.test_boundary_reward \
+  wote_mining.tests.test_reward_topk_supervision -v
+```

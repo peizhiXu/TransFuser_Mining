@@ -29,6 +29,7 @@ class WoTEMiningConfig(GlobalConfig):
     wote_reward_scheme = "source"
     wote_boundary_target_m = 0.6  # pilot setting, to be checked on train labels
     wote_boundary_reward_weight = 0.2  # bounded, soft preference (not a veto)
+    wote_ttc_reward_weight = 0.2  # mining_boundary_ttc only; bounded safety bonus
     # Source WoTE training defaults (configs/default.py).
     wote_num_future_map_candidates = 1
     wote_traj_offset_loss_weight = 1.0

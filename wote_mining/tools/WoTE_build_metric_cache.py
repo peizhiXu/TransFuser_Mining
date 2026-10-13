@@ -20,7 +20,7 @@ from wote_mining.tools.WoTE_build_anchors import (
 )
 from wote_mining.WoTE_targets import recorded_vehicle_tracks
 from wote_mining.WoTE_reward_schema import (
-    REWARD_SCHEMES, BOUNDARY_LABEL_VERSION, metric_names_for_scheme,
+    REWARD_SCHEMES, BOUNDARY_SCHEMES, BOUNDARY_LABEL_VERSION, TTC_LABEL_VERSION, metric_names_for_scheme,
     validate_boundary_settings,
 )
 from wote_mining.WoTE_simulator import evaluate_mining_candidates
@@ -120,13 +120,15 @@ def _write_manifest(output_dir, args, anchors_sha256, routes):
         "target_sums": target_sums.tolist(),
         "routes": routes,
     }
-    if args.reward_scheme == "mining_boundary":
+    if args.reward_scheme in BOUNDARY_SCHEMES:
         manifest["boundary_label_settings"] = dict(
             version=BOUNDARY_LABEL_VERSION, target_m=args.boundary_target_m,
             vehicle_length_m=9.3969, vehicle_width_m=5.3645,
             footprint_spacing_m=0.5, sample_interval_s=0.125,
             includes_current_pose=False,
         )
+    if args.reward_scheme == "mining_boundary_ttc":
+        manifest["ttc_label_version"] = TTC_LABEL_VERSION
     (output_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
@@ -221,7 +223,7 @@ def main():
             ),
             "seconds": round(time.monotonic() - started, 3),
         }
-        if args.reward_scheme == "mining_boundary":
+        if args.reward_scheme in BOUNDARY_SCHEMES:
             boundary = targets[..., 3]
             observed = valid[..., 3].astype(bool)
             values = boundary[observed]

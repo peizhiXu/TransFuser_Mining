@@ -260,6 +260,26 @@ class TrainingIntegrationTests(unittest.TestCase):
         )
         return module, batch
 
+    def test_boundary_ttc_training_graph_trains_five_heads_and_world(self):
+        module, batch = self.make_training_module(reward_scheme='mining_boundary_ttc')
+        outputs = module(batch)
+        self.assertEqual(outputs['metric_logits'].shape, (1, 8, 5))
+        self.assertEqual(outputs['metric_names'][-2:], ('road_boundary_margin', 'time_to_collision'))
+        diagnostics, _ = module.compute_diagnostics(batch, outputs)
+        self.assertIn('metric_time_to_collision_mae', diagnostics)
+        self.assertIn('metric_road_boundary_margin_mae', diagnostics)
+        self.assertNotIn('metric_comfort_mae', diagnostics)
+        module.compute_losses(batch, outputs)['loss_total'].backward()
+        for index in (3, 4):
+            grad = module.planner.reward_head.metric_heads[index][-1].weight.grad
+            self.assertTrue(torch.isfinite(grad).all())
+            self.assertGreater(grad.abs().sum().item(), 0.)
+        grad = module.planner.world_model.transition.layers[0].self_attn.in_proj_weight.grad
+        self.assertIsNotNone(grad)
+        self.assertTrue(torch.isfinite(grad).all())
+        self.assertEqual([name for name, param in module.named_parameters()
+                          if param.requires_grad and param.grad is None], [])
+
     def test_boundary_training_graph_uses_four_heads_and_trains_world_model(self):
         module, batch = self.make_training_module(reward_scheme='mining_boundary')
         module.eval()

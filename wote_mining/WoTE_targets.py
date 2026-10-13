@@ -292,6 +292,7 @@ import numpy as np
 
 from wote_mining.WoTE_reward_schema import (
     SOURCE_METRIC_NAMES as METRIC_NAMES, BOUNDARY_LABEL_VERSION,
+    BOUNDARY_TTC_METRIC_NAMES, TTC_LABEL_VERSION,
 )
 
 
@@ -309,6 +310,9 @@ def metric_cache_file_for_collection(route_dir, cache_dir,
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if tuple(manifest["metric_names"]) != tuple(metric_names):
             raise ValueError("metric cache schema mismatch in %s; rebuild labels for the selected reward scheme" % manifest_path)
+        if tuple(metric_names) == BOUNDARY_TTC_METRIC_NAMES:
+            if manifest.get("ttc_label_version") != TTC_LABEL_VERSION:
+                raise ValueError("TTC label definition mismatch in %s" % manifest_path)
         if boundary_target_m is not None:
             settings = manifest.get("boundary_label_settings", {})
             if (settings.get("version") != BOUNDARY_LABEL_VERSION

@@ -398,7 +398,8 @@ class WoTEMiningRewardHead(nn.Module):
     """Score [B,K] candidates from current/future BEV and action features."""
 
     def __init__(self, hidden_dim=256, weights=(0.1, 0.5, 0.5, 1.0),
-                 reward_scheme="source", boundary_reward_weight=0.2):
+                 reward_scheme="source", boundary_reward_weight=0.2,
+                 ttc_reward_weight=0.2):
         super().__init__()
         if len(weights) != 4 or any(weight < 0 for weight in weights):
             raise ValueError("reward weights must contain four nonnegative values")
@@ -407,6 +408,9 @@ class WoTEMiningRewardHead(nn.Module):
         self.metric_names = metric_names_for_scheme(reward_scheme)
         validate_boundary_settings(0.6, boundary_reward_weight)
         self.boundary_reward_weight = float(boundary_reward_weight)
+        from wote_mining.WoTE_reward_schema import validate_ttc_weight
+        validate_ttc_weight(ttc_reward_weight)
+        self.ttc_reward_weight = float(ttc_reward_weight)
         self.register_buffer("weights", torch.tensor(weights, dtype=torch.float32))
         self.reward_conv = nn.Sequential(
             nn.Conv2d(2 * hidden_dim, hidden_dim, 3, padding=1),
@@ -469,8 +473,9 @@ class WoTEMiningRewardHead(nn.Module):
         """Compose either legacy five-metric or mining boundary rewards.
 
         The source schema retains its exact formula. Mining uses imitation,
-        NC, DAC, log(1+EP), and a bounded boundary bonus; TTC/Comfort heads
-        do not exist in that schema. A higher final reward is better.
+        NC, DAC, log(1+EP), and a bounded boundary bonus. The TTC experiment
+        adds an independent bounded TTC safety bonus, preserving these terms.
+        A higher final reward is better.
         """
         if imitation_logits.ndim != 2 or metric_logits.shape != (
             imitation_logits.shape[0], imitation_logits.shape[1], len(self.metric_names)
@@ -486,7 +491,7 @@ class WoTEMiningRewardHead(nn.Module):
         log_drivable = F.logsigmoid(metric_logits[..., 1])
         progress = metric_scores[..., 2]
         w = self.weights.to(dtype=imitation_logits.dtype)
-        if self.reward_scheme == "mining_boundary":
+        if self.reward_scheme in ("mining_boundary", "mining_boundary_ttc"):
             # Bounded progress allows legitimate stops (EP=0 is finite).
             # Boundary is a soft bounded bonus, never a logarithmic barrier.
             final_rewards = (
@@ -494,6 +499,8 @@ class WoTEMiningRewardHead(nn.Module):
                 + w[2] * log_drivable + w[3] * torch.log1p(progress)
                 + self.boundary_reward_weight * metric_scores[..., 3]
             )
+            if self.reward_scheme == "mining_boundary_ttc":
+                final_rewards = final_rewards + self.ttc_reward_weight * metric_scores[..., 4]
             return final_rewards, log_imitation.exp(), metric_scores
         ttc = metric_scores[..., 3]
         comfort = metric_scores[..., 4]
@@ -929,6 +936,7 @@ class WoTEMiningPlanner(nn.Module):
             weights=getattr(backbone.config, "wote_reward_weights", (0.1, 0.5, 0.5, 1.0)),
             reward_scheme=getattr(backbone.config, "wote_reward_scheme", "source"),
             boundary_reward_weight=getattr(backbone.config, "wote_boundary_reward_weight", 0.2),
+            ttc_reward_weight=getattr(backbone.config, "wote_ttc_reward_weight", 0.2),
         )
         self.current_agent_head = WoTEMiningAgentHead(
             lidar_x=backbone.config.lidar_pos[0]

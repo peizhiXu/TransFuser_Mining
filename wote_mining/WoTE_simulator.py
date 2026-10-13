@@ -841,11 +841,17 @@ def evaluate_mining_candidates(trajectories, road_map, route_xy,
     mask = mask | comfort_mask
     from wote_mining.WoTE_reward_schema import metric_names_for_scheme
     metric_names_for_scheme(reward_scheme)
-    if reward_scheme == "mining_boundary":
+    if reward_scheme in ("mining_boundary", "mining_boundary_ttc"):
         # No relabelling of the old TTC/Comfort slots: a new named schema
         # forces cache/checkpoint consumers to acknowledge the changed task.
-        targets = np.concatenate((targets[:, :3], road["road_boundary_margin"][:, None]), axis=1)
-        mask = np.concatenate((mask[:, :3], road["road_boundary_valid"][:, None]), axis=1)
+        source_targets, source_mask = targets, mask
+        targets = np.concatenate((source_targets[:, :3], road["road_boundary_margin"][:, None]), axis=1)
+        mask = np.concatenate((source_mask[:, :3], road["road_boundary_valid"][:, None]), axis=1)
+        if reward_scheme == "mining_boundary_ttc":
+            # Append the existing TTC labels/masks; never substitute comfort
+            # or mark unknown actor coverage as a safe TTC example.
+            targets = np.concatenate((targets, source_targets[:, 3:4]), axis=1)
+            mask = np.concatenate((mask, source_mask[:, 3:4]), axis=1)
     result = {
         "metric_targets": targets,
         "metric_valid": mask,

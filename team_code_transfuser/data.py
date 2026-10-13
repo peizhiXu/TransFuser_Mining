@@ -37,7 +37,7 @@ class CARLA_Data(Dataset):
             from wote_mining.WoTE_reward_schema import metric_names_for_scheme
             scheme = getattr(config, 'wote_reward_scheme', 'source')
             self.wote_metric_names = metric_names_for_scheme(scheme)
-            if scheme == 'mining_boundary':
+            if scheme in ('mining_boundary', 'mining_boundary_ttc'):
                 self.wote_boundary_target_m = config.wote_boundary_target_m
         if self.wote_future_poses and (int(self.pred_len) != 8 or int(self.seq_len) != 1):
             raise ValueError('WoTE mining targets require seq_len=1 and pred_len=8')

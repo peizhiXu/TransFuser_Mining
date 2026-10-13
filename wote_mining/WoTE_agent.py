@@ -405,7 +405,7 @@ class WoTEMiningAgent(HybridAgent):
         restore_reward_settings(saved_config, checkpoint.get('args', {}), checkpoint.get('config', {}))
         expected, actual = reward_settings(self.config), reward_settings(saved_config)
         if (expected['scheme'] != actual['scheme']
-                or (actual['scheme'] == 'mining_boundary' and expected != actual)):
+                or (actual['scheme'] in ('mining_boundary', 'mining_boundary_ttc') and expected != actual)):
             raise ValueError('args.json and checkpoint reward settings disagree; copy args.json from the same training run')
         return checkpoint['model']
 

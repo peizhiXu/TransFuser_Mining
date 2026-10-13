@@ -24,7 +24,8 @@ from wote_mining.WoTE_loss import (
 )
 from wote_mining.WoTE_model import METRIC_NAMES, current_semantic_map_loss
 from wote_mining.WoTE_reward_schema import (
-    REWARD_SCHEMES, BOUNDARY_LABEL_VERSION, metric_names_for_scheme, validate_boundary_settings,
+    REWARD_SCHEMES, BOUNDARY_SCHEMES, BOUNDARY_LABEL_VERSION, TTC_LABEL_VERSION,
+    metric_names_for_scheme, validate_boundary_settings, validate_ttc_weight,
     reward_settings, restore_reward_settings,
 )
 
@@ -381,6 +382,8 @@ def parse_args():
                         help="saturation clearance in meters; must match cache manifest")
     parser.add_argument("--boundary-reward-weight", type=float, default=0.2,
                         help="bounded soft boundary bonus; 0 disables its selection effect")
+    parser.add_argument("--ttc-reward-weight", type=float, default=WoTEMiningConfig.wote_ttc_reward_weight,
+                        help="mining_boundary_ttc only: bounded TTC safety bonus; 0 disables its selection effect")
     parser.add_argument("--metric-cache-dir", default=None,
                         help="cache root containing train/val manifests for this reward scheme")
     parser.add_argument(
@@ -501,11 +504,17 @@ def validate_reward_cache(config, anchors_path):
             raise ValueError("reward cache schema mismatch: %s" % path)
         if manifest.get("anchors_sha256") != anchors_hash:
             raise ValueError("reward cache anchors differ from training anchors: %s" % path)
-        if config.wote_reward_scheme == "mining_boundary":
+        if config.wote_reward_scheme in BOUNDARY_SCHEMES:
             settings = manifest.get("boundary_label_settings", {})
             if (settings.get("version") != BOUNDARY_LABEL_VERSION
                     or settings.get("target_m") != config.wote_boundary_target_m):
                 raise ValueError("boundary cache definition/threshold mismatch: %s" % path)
+        if config.wote_reward_scheme == "mining_boundary_ttc":
+            if manifest.get("ttc_label_version") != TTC_LABEL_VERSION:
+                raise ValueError("TTC cache definition mismatch: %s" % path)
+            index = expected_names.index("time_to_collision")
+            if manifest.get("valid_counts", [0] * len(expected_names))[index] <= 0:
+                raise ValueError("TTC cache has no valid labels: %s" % path)
 
 
 def reduce_loss_sums(loss_sums, batches, device, distributed):
@@ -720,9 +729,12 @@ def backfill_tensorboard(writer, metrics_path, before_epoch):
 
 def main():
     args = parse_args()
-    if args.reward_scheme == "mining_boundary":
+    if args.reward_scheme in BOUNDARY_SCHEMES:
         args.boundary_label_version = BOUNDARY_LABEL_VERSION
+    if args.reward_scheme == "mining_boundary_ttc":
+        args.ttc_label_version = TTC_LABEL_VERSION
     validate_boundary_settings(args.boundary_target_m, args.boundary_reward_weight)
+    validate_ttc_weight(args.ttc_reward_weight)
     if args.save_every < 0:
         raise ValueError("--save-every must be non-negative")
     if not 0 <= args.reward_topk < WoTEMiningConfig.num_traj_anchors:
@@ -746,10 +758,12 @@ def main():
     config.wote_reward_scheme = args.reward_scheme
     config.wote_boundary_target_m = args.boundary_target_m
     config.wote_boundary_reward_weight = args.boundary_reward_weight
+    config.wote_ttc_reward_weight = args.ttc_reward_weight
     if args.metric_cache_dir:
         config.wote_metric_cache_dir = args.metric_cache_dir
-    elif args.reward_scheme == "mining_boundary":
-        config.wote_metric_cache_dir = str(ROOT / "wote_mining/assets/metric_cache_boundary")
+    elif args.reward_scheme in BOUNDARY_SCHEMES:
+        cache_name = "metric_cache_boundary_ttc" if args.reward_scheme == "mining_boundary_ttc" else "metric_cache_boundary"
+        config.wote_metric_cache_dir = str(ROOT / "wote_mining/assets" / cache_name)
     if not prepared:
         cache_root = Path(config.wote_metric_cache_dir)
         config.train_data = route_dirs_from_manifest(
@@ -801,7 +815,7 @@ def main():
         previous_reward = reward_settings(previous_reward_config)
         current_reward = reward_settings(config)
         if (previous_reward["scheme"] != current_reward["scheme"]
-                or (current_reward["scheme"] == "mining_boundary" and previous_reward != current_reward)):
+                or (current_reward["scheme"] in BOUNDARY_SCHEMES and previous_reward != current_reward)):
             raise ValueError("cannot resume with a changed reward schema/label definition; start a new training run")
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
@@ -896,6 +910,9 @@ def main():
             config.wote_reward_scheme, metric_names_for_scheme(config.wote_reward_scheme),
             config.wote_boundary_target_m, config.wote_boundary_reward_weight,
         ))
+        if config.wote_reward_scheme == "mining_boundary_ttc":
+            print("ttc_reward_weight=%.3f ttc_label_version=%s" % (
+                config.wote_ttc_reward_weight, TTC_LABEL_VERSION))
 
     for epoch in range(start_epoch, args.epochs):
         if train_sampler is not None:
