@@ -222,6 +222,7 @@ class TrainingIntegrationTests(unittest.TestCase):
 
     def make_training_module(self, loss_weight=0.25, reward_scheme='source'):
         config = self.config_type(setting='eval')
+        config.set_planner_mode('future_reward')
         config.use_target_point_image = True
         config.wote_reward_topk_loss_weight = loss_weight
         config.wote_reward_scheme = reward_scheme

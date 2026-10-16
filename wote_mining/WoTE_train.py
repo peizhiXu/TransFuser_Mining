@@ -41,6 +41,10 @@ class WoTEMiningTrainingModule(nn.Module):
                 or config.wote_reward_topk_loss_weight < 0.0):
             raise ValueError("reward top-k loss weight must be finite and nonnegative")
 
+    @property
+    def current_only(self):
+        return getattr(self.config, "wote_planner_mode", "future_reward") == "current_only"
+
     def _future_map_indices(self, future_poses):
         batch = future_poses.shape[0]
         count = self.planner.trajectory_head.anchors.shape[0]
@@ -69,6 +73,8 @@ class WoTEMiningTrainingModule(nn.Module):
         speed = batch["speed"].float().reshape(-1, 1)
         target_point = batch["target_point"].float()
         future_poses = batch["wote_future_poses"].float()
+        if self.current_only:
+            return self.planner(rgb, lidar, speed, target_point, predict_auxiliary=False)
         future_map_indices = self._future_map_indices(future_poses)
         outputs = self.planner(
             rgb, lidar, speed, target_point,
@@ -94,6 +100,17 @@ class WoTEMiningTrainingModule(nn.Module):
         return outputs
 
     def compute_losses(self, batch, outputs):
+        if self.current_only:
+            raw = source_style_core_losses(
+                outputs, batch["wote_future_poses"].float(), include_reward=False
+            )
+            raw.pop("matched_anchor")
+            losses = {
+                "loss_traj_offset": raw["loss_traj_offset"] * self.config.wote_traj_offset_loss_weight,
+                "loss_offset_imitation": raw["loss_offset_imitation"] * self.config.wote_offset_imitation_loss_weight,
+            }
+            losses["loss_total"] = sum(losses.values())
+            return losses
         core = source_style_core_losses(
             outputs,
             batch["wote_future_poses"].float(),
@@ -141,6 +158,24 @@ class WoTEMiningTrainingModule(nn.Module):
     @torch.no_grad()
     def compute_diagnostics(self, batch, outputs):
         """Return detached training diagnostics which never enter loss_total."""
+        if self.current_only:
+            future = batch["wote_future_poses"].to(outputs["trajectories"]).float()
+            trajectories = outputs["trajectories"].float()
+            distances = torch.linalg.vector_norm(
+                (outputs["anchors"].float() - future[:, None]).flatten(2), dim=-1
+            )
+            oracle = distances.argmin(dim=1)
+            rows = torch.arange(future.shape[0], device=future.device)
+            diagnostics = {}
+            for prefix, trajectory in (
+                ("traj_matched", trajectories[rows, oracle]),
+                ("traj_selected", outputs["selected_trajectory"].float()),
+            ):
+                error = torch.linalg.vector_norm(trajectory[..., :2] - future[..., :2], dim=-1)
+                diagnostics[prefix + "_ade_m"] = error.mean()
+                diagnostics[prefix + "_fde_m"] = error[:, -1].mean()
+            diagnostics["candidate_selection_accuracy"] = (outputs["selected_index"] == oracle).float().mean()
+            return diagnostics, {name: future.new_tensor(future.shape[0]) for name in diagnostics}
         logits = outputs["metric_logits"].float()
         metric_names = outputs.get("metric_names", METRIC_NAMES)
         targets = batch["wote_metric_targets"].to(logits).float()
@@ -365,6 +400,8 @@ def parse_args():
     )
     parser.add_argument("--output-dir", default=str(ROOT / "log/wote-mining"))
     parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--planner-mode", choices=("current_only", "future_reward"),
+                        default=WoTEMiningConfig.wote_planner_mode)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -611,7 +648,8 @@ def run_epoch(model, loader, optimizer, scaler, device, config, epoch,
                     "future_map_logits",
                 )
                 probes = {name: outputs[name] for name in probe_names if name in outputs}
-                probes["target_current_agent_boxes"] = batch["wote_current_agent_boxes"]
+                if "wote_current_agent_boxes" in batch:
+                    probes["target_current_agent_boxes"] = batch["wote_current_agent_boxes"]
                 require_finite_tensors(probes, numeric_context + " forward", distributed)
                 module = model.module if isinstance(model, DistributedDataParallel) else model
                 losses = module.compute_losses(batch, outputs)
@@ -665,9 +703,11 @@ def save_checkpoint(path, model, optimizer, scaler, epoch, args, config,
         "scaler": scaler.state_dict(),
         "args": vars(args),
         "config": {
+            "planner_mode": config.wote_planner_mode,
             "reward_weights": tuple(config.wote_reward_weights),
             "reward_scheme_settings": reward_settings(config),
-            "metric_names": metric_names_for_scheme(getattr(config, "wote_reward_scheme", "source")),
+            "metric_names": ([] if getattr(config, "wote_planner_mode", "future_reward") == "current_only"
+                             else metric_names_for_scheme(getattr(config, "wote_reward_scheme", "source"))),
             "loss_weights": {
                 name: getattr(config, name) for name in (
                     "wote_traj_offset_loss_weight",
@@ -755,6 +795,9 @@ def main():
     config = WoTEMiningConfig(
         root_dir=args.root_dir, setting=("mining" if prepared else "eval")
     )
+    config.set_planner_mode(args.planner_mode)
+    if args.planner_mode == "current_only" and not prepared:
+        raise ValueError("current-only baseline requires a prepared root with train/ and val/")
     config.wote_reward_scheme = args.reward_scheme
     config.wote_boundary_target_m = args.boundary_target_m
     config.wote_boundary_reward_weight = args.boundary_reward_weight
@@ -782,6 +825,11 @@ def main():
     config.wote_reward_topk_loss_weight = args.reward_topk_loss_weight
     config.wote_reward_topk_ade_max_m = args.reward_topk_ade_max_m
     config.wote_reward_topk_endpoint_max_m = args.reward_topk_endpoint_max_m
+    if args.planner_mode == "current_only":
+        config.set_planner_mode("current_only")
+        # Record the effective objective in args.json as well as checkpoint config.
+        args.reward_topk = 0
+        args.reward_topk_loss_weight = 0.0
     config.wote_lr = args.lr
     config.wote_min_lr = args.min_lr
     config.wote_weight_decay = args.weight_decay
@@ -793,7 +841,8 @@ def main():
         raise FileNotFoundError("trajectory anchors not found: %s" % args.anchors)
     if config.augment:
         raise ValueError("cached WoTE metric labels require config.augment=False")
-    validate_reward_cache(config, args.anchors)
+    if args.planner_mode != "current_only":
+        validate_reward_cache(config, args.anchors)
 
     backbone = TransfuserBackbone(
         config,
@@ -810,6 +859,11 @@ def main():
     best_val_loss = float("inf")
     if args.resume:
         checkpoint = torch.load(args.resume, map_location=device)
+        saved_mode = checkpoint.get("config", {}).get(
+            "planner_mode", checkpoint.get("args", {}).get("planner_mode", "future_reward")
+        )
+        if saved_mode != args.planner_mode:
+            raise ValueError("cannot resume a different planner architecture; start a new run")
         previous_reward_config = WoTEMiningConfig(setting="eval")
         restore_reward_settings(previous_reward_config, checkpoint.get("args", {}), checkpoint.get("config", {}))
         previous_reward = reward_settings(previous_reward_config)
@@ -901,16 +955,21 @@ def main():
         print("device=%s world_size=%d train=%d val=%d" % (
             device, world_size, len(train_set), len(val_set)
         ))
-        print("reward_topk=%d weight=%.3f ADE<=%.2fm FDE<=%.2fm" % (
-            config.wote_reward_topk, config.wote_reward_topk_loss_weight,
-            config.wote_reward_topk_ade_max_m,
-            config.wote_reward_topk_endpoint_max_m,
+        print("planner_mode=%s selection=%s" % (
+            config.wote_planner_mode,
+            "score_head" if args.planner_mode == "current_only" else "reward_head",
         ))
-        print("reward_scheme=%s metrics=%s boundary_target=%.2fm boundary_weight=%.3f" % (
-            config.wote_reward_scheme, metric_names_for_scheme(config.wote_reward_scheme),
-            config.wote_boundary_target_m, config.wote_boundary_reward_weight,
-        ))
-        if config.wote_reward_scheme == "mining_boundary_ttc":
+        if args.planner_mode != "current_only":
+            print("reward_topk=%d weight=%.3f ADE<=%.2fm FDE<=%.2fm" % (
+                config.wote_reward_topk, config.wote_reward_topk_loss_weight,
+                config.wote_reward_topk_ade_max_m,
+                config.wote_reward_topk_endpoint_max_m,
+            ))
+            print("reward_scheme=%s metrics=%s boundary_target=%.2fm boundary_weight=%.3f" % (
+                config.wote_reward_scheme, metric_names_for_scheme(config.wote_reward_scheme),
+                config.wote_boundary_target_m, config.wote_boundary_reward_weight,
+            ))
+        if args.planner_mode != "current_only" and config.wote_reward_scheme == "mining_boundary_ttc":
             print("ttc_reward_weight=%.3f ttc_label_version=%s" % (
                 config.wote_ttc_reward_weight, TTC_LABEL_VERSION))
 

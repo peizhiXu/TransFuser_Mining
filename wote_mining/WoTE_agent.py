@@ -124,12 +124,13 @@ class WoTEMiningInferenceModel(nn.Module):
             )
             planner = WoTEMiningPlanner(backbone, anchors_path)
         self.planner = planner
-        self.world_passes = os.environ.get("WOTE_WORLD_PASSES", "1")
-        if self.world_passes not in ("1", "2"):
+        self.current_only = getattr(config, "wote_planner_mode", "future_reward") == "current_only"
+        self.world_passes = "0" if self.current_only else os.environ.get("WOTE_WORLD_PASSES", "1")
+        if not self.current_only and self.world_passes not in ("1", "2"):
             raise ValueError("WOTE_WORLD_PASSES must be 1 or 2")
-        print("WoTE inference: world_passes=%s; reward_source=%s; execution=decoded_trajectories" % (
+        print("WoTE inference: world_passes=%s; selection=%s; execution=decoded_trajectories" % (
             self.world_passes,
-            "anchor_proxy" if self.world_passes == "1" else "decoded_world",
+            "score_head" if self.current_only else ("anchor_proxy" if self.world_passes == "1" else "decoded_world"),
         ), flush=True)
         self.config = config
         self.controller = HD465TrajectoryController(config)
@@ -221,7 +222,9 @@ class WoTEMiningInferenceModel(nn.Module):
             "WoTE HD465 closed-loop",
             "frame: %d" % data["frame"],
             "anchor: %s" % diagnostics.get("selected_anchor_index", "n/a"),
-            "reward: %.5f" % diagnostics.get("selected_reward", float("nan")),
+            ("candidate score: %.5f" % diagnostics["selected_score"]
+             if "selected_score" in diagnostics else
+             "reward: %.5f" % diagnostics.get("selected_reward", float("nan"))),
             "speed: %.2f m/s   desired: %.2f m/s" % (
                 data["speed"], telemetry.get("desired_speed", float("nan"))
             ),
@@ -282,11 +285,35 @@ class WoTEMiningInferenceModel(nn.Module):
             reuse_anchor_rewards=(self.world_passes == "1"),
         )
         selected = outputs["selected_trajectory"]
+        self.last_diagnostics = self._selection_diagnostics(outputs, selected)
+        self.debug_step += 1
+        if (kwargs.get("debug", False) and kwargs.get("save_path") is not None
+                and self.debug_step % 2 == 0):
+            self._cache_debug_frame(
+                rgb, lidar_visual, target_point, selected, ego_vel,
+                kwargs["save_path"], kwargs.get("stuck_detector", 0),
+                kwargs.get("forced_move", False),
+            )
+        else:
+            self._pending_debug = None
+        return selected[..., :2], []
+
+    def _selection_diagnostics(self, outputs, selected):
         batch_index = torch.arange(selected.shape[0], device=selected.device)
         selected_local = outputs["selected_index"]
+        if self.current_only:
+            return {
+                "world_passes": 0,
+                "selection_source": "score_head",
+                "execution_source": "current_bev_trajectories",
+                "selected_anchor_index": int(outputs["selected_anchor_index"][0].detach().cpu()),
+                "selected_score": float(outputs["scores"][batch_index, selected_local][0].detach().cpu()),
+                "metric_names": [],
+                "selected_metric_scores": [],
+            }
         selected_metrics = outputs["metric_scores"][batch_index, selected_local]
         selected_rewards = outputs["final_rewards"][batch_index, selected_local]
-        self.last_diagnostics = {
+        diagnostics = {
             "world_passes": int(self.world_passes),
             "reward_source": "anchor_proxy" if self.world_passes == "1" else "decoded_world",
             "execution_source": "decoded_trajectories",
@@ -300,18 +327,8 @@ class WoTEMiningInferenceModel(nn.Module):
                 float(value) for value in selected_metrics[0].detach().cpu()
             ],
         }
-        self.last_diagnostics.update(reward_topk_diagnostics(outputs))
-        self.debug_step += 1
-        if (kwargs.get("debug", False) and kwargs.get("save_path") is not None
-                and self.debug_step % 2 == 0):
-            self._cache_debug_frame(
-                rgb, lidar_visual, target_point, selected, ego_vel,
-                kwargs["save_path"], kwargs.get("stuck_detector", 0),
-                kwargs.get("forced_move", False),
-            )
-        else:
-            self._pending_debug = None
-        return selected[..., :2], []
+        diagnostics.update(reward_topk_diagnostics(outputs))
+        return diagnostics
 
     def control_pid(self, waypoints, velocity, is_stuck, pitch=0.0):
         return self.controller.control_pid(
@@ -349,6 +366,8 @@ class WoTEMiningAgent(HybridAgent):
         if self.config.use_point_pillars:
             raise ValueError('WoTE mining Agent currently requires histogram LiDAR BEV')
         self.config.multitask = False
+        # Old checkpoints without a mode are full world/reward models.
+        self.config.set_planner_mode(self.args.get('planner_mode', 'future_reward'))
         from wote_mining.WoTE_reward_schema import restore_reward_settings
         restore_reward_settings(self.config, self.args)
 
@@ -400,6 +419,13 @@ class WoTEMiningAgent(HybridAgent):
     def _checkpoint_state_dict(self, checkpoint):
         if not isinstance(checkpoint, dict) or 'model' not in checkpoint:
             raise ValueError('WoTE checkpoint must contain a model state_dict')
+        saved_mode = checkpoint.get('config', {}).get(
+            'planner_mode', checkpoint.get('args', {}).get('planner_mode', 'future_reward')
+        )
+        if saved_mode != self.config.wote_planner_mode:
+            raise ValueError('args.json and checkpoint planner modes disagree')
+        if saved_mode == 'current_only':
+            return checkpoint['model']
         from wote_mining.WoTE_reward_schema import restore_reward_settings, reward_settings
         saved_config = WoTEMiningConfig(setting='eval')
         restore_reward_settings(saved_config, checkpoint.get('args', {}), checkpoint.get('config', {}))

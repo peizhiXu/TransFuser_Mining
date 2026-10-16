@@ -107,18 +107,20 @@ def reward_topk_trajectory_loss(outputs, future_poses):
 
 
 def source_style_core_losses(outputs, future_poses, metric_targets=None,
-                             metric_valid=None):
+                             metric_valid=None, include_reward=True):
     """WTA offset + soft imitation objectives and named candidate metric heads.
 
     ``metric_targets`` [B,K,M], if supplied, must be independently defined
     candidate-level values in [0,1]. ``metric_valid`` masks any unavailable
     candidate/metric labels. The function does not include map/agent losses;
     their matching and spatial masks live with those modules.
+    With ``include_reward=False``, return only the unchanged WTA offset and
+    soft score-head classification objectives; no reward outputs are read.
     """
     anchors = outputs["anchors"]
     offsets = outputs["offsets"]
     offset_logits = outputs["scores"]
-    imitation_logits = outputs["imitation_logits"]
+    imitation_logits = outputs.get("imitation_logits") if include_reward else None
     if anchors.ndim != 4 or anchors.shape[2:] != (8, 3):
         raise ValueError("anchors must have shape [B,K,8,3]")
     batch, count = anchors.shape[:2]
@@ -126,7 +128,7 @@ def source_style_core_losses(outputs, future_poses, metric_targets=None,
         raise ValueError("offsets/future poses have incompatible shapes")
     if offset_logits.shape != (batch, count):
         raise ValueError("offset scores must have shape [B,K]")
-    if imitation_logits.shape != (batch, count):
+    if include_reward and imitation_logits.shape != (batch, count):
         raise ValueError("full candidate imitation logits must have shape [B,K]")
 
     # Match the source's Euclidean distance in flattened 24-D pose space.
@@ -143,11 +145,15 @@ def source_style_core_losses(outputs, future_poses, metric_targets=None,
         "loss_offset_imitation": -(
             soft_target * F.log_softmax(offset_logits, dim=-1)
         ).sum(dim=-1).mean(),
-        "loss_imitation_reward": -(
-            soft_target * F.log_softmax(imitation_logits, dim=-1)
-        ).sum(dim=-1).mean(),
         "matched_anchor": winner,
     }
+    if not include_reward:
+        if metric_targets is not None or metric_valid is not None:
+            raise ValueError("current-only objectives do not accept reward targets")
+        return losses
+    losses["loss_imitation_reward"] = -(
+        soft_target * F.log_softmax(imitation_logits, dim=-1)
+    ).sum(dim=-1).mean()
 
     if metric_targets is not None:
         if metric_targets.ndim != 3 or metric_targets.shape[:2] != (batch, count):

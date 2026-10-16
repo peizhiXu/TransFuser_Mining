@@ -6,6 +6,8 @@ from team_code_transfuser.config import GlobalConfig
 
 
 class WoTEMiningConfig(GlobalConfig):
+    # This branch's baseline uses only current BEV, offsets and candidate scores.
+    wote_planner_mode = "current_only"
     pred_len = 8  # 4 seconds at the dataset's 2 Hz recording rate
     # Cached candidate scores correspond to the unrotated 256 anchors. The
     # legacy TransFuser rotation augmentation changes the scene/trajectory
@@ -55,3 +57,26 @@ class WoTEMiningConfig(GlobalConfig):
     wote_image_encoder_lr_multiplier = 0.1
     wote_warmup_epochs = 3
     wote_max_epochs = 100
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.set_planner_mode(self.wote_planner_mode)
+
+    def set_planner_mode(self, mode):
+        if mode not in ("current_only", "future_reward"):
+            raise ValueError("unknown planner mode: %s" % mode)
+        self.wote_planner_mode = mode
+        for name, disabled in (
+            ("wote_future_scene_targets", False),
+            ("wote_metric_cache_dir", None),
+            ("wote_dense_routes_dir", None),
+            ("wote_reward_topk", 0),
+            ("wote_reward_topk_loss_weight", 0.0),
+            ("wote_imitation_reward_loss_weight", 0.0),
+            ("wote_metric_reward_loss_weight", 0.0),
+            ("wote_current_map_loss_weight", 0.0),
+            ("wote_future_map_loss_weight", 0.0),
+            ("wote_agent_presence_loss_weight", 0.0),
+            ("wote_agent_box_loss_weight", 0.0),
+        ):
+            setattr(self, name, disabled if mode == "current_only" else getattr(type(self), name))

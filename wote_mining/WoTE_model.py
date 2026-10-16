@@ -676,7 +676,8 @@ from torch.nn import functional as F
 class WoTEMiningTrajectoryHead(nn.Module):
     """Decode anchor offsets from the current and predicted future BEV."""
 
-    def __init__(self, anchors_path, hidden_dim=256, layers=2, heads=8):
+    def __init__(self, anchors_path, hidden_dim=256, layers=2, heads=8,
+                 enable_future=True):
         super().__init__()
         anchors = np.load(Path(anchors_path), allow_pickle=False)
         if anchors.ndim != 3 or anchors.shape[1:] != (8, 3):
@@ -714,6 +715,12 @@ class WoTEMiningTrajectoryHead(nn.Module):
             ),
             num_layers=layers,
         )
+        self.offset_head = nn.Linear(hidden_dim, 24)
+        self.score_head = nn.Linear(hidden_dim, 1)
+        nn.init.zeros_(self.offset_head.weight)
+        nn.init.zeros_(self.offset_head.bias)
+        if not enable_future:
+            return
         # The same candidate query reads its own predicted future BEV.  This
         # is the second BEV input of the original trajectory decoder, not a
         # post-hoc trajectory refiner.
@@ -745,11 +752,6 @@ class WoTEMiningTrajectoryHead(nn.Module):
         nn.init.zeros_(self.future_adaln_modulation[-1].weight)
         nn.init.zeros_(self.future_adaln_modulation[-1].bias)
         self.future_candidate_chunk = 16
-        self.offset_head = nn.Linear(hidden_dim, 24)
-        self.score_head = nn.Linear(hidden_dim, 1)
-        # Start exactly on the fixed anchor distribution before training.
-        nn.init.zeros_(self.offset_head.weight)
-        nn.init.zeros_(self.offset_head.bias)
 
     def encode_trajectory_features(self, trajectories, speed, target_point):
         """Encode fixed or decoded trajectories without BEV offset decoding.
@@ -910,7 +912,7 @@ class WoTEMiningTrajectoryHead(nn.Module):
 
 
 class WoTEMiningPlanner(nn.Module):
-    """Connect TransFuser to WoTE queries with current/future BEV fusion."""
+    """Decode current-BEV candidates, optionally adding future/reward branches."""
 
     def __init__(self, backbone, anchors_path):
         super().__init__()
@@ -928,7 +930,12 @@ class WoTEMiningPlanner(nn.Module):
         )
         for module in unused_output_heads:
             module.requires_grad_(False)
-        self.trajectory_head = WoTEMiningTrajectoryHead(anchors_path)
+        self.current_only = getattr(backbone.config, "wote_planner_mode", "future_reward") == "current_only"
+        self.trajectory_head = WoTEMiningTrajectoryHead(
+            anchors_path, enable_future=not self.current_only
+        )
+        if self.current_only:
+            return
         self.world_model = WoTEMiningWorldModel(
             lidar_x=backbone.config.lidar_pos[0]
         )
@@ -957,6 +964,11 @@ class WoTEMiningPlanner(nn.Module):
             rgb, lidar_bev, speed, return_fused_lidar=True
         )
         result = self.trajectory_head(fused_lidar, speed, target_point)
+        if self.current_only:
+            if world_candidate_indices is not None:
+                raise ValueError("current-only selection requires the full candidate bank")
+            result.update(select_best_trajectory(result["scores"], result["trajectories"]))
+            return result
         if predict_auxiliary:
             current_map = result["bev_tokens"].transpose(1, 2).reshape(
                 result["bev_tokens"].shape[0], 256, 8, 8
