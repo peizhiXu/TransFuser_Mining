@@ -24,6 +24,13 @@ the checkpoint when using `wote_mining/WoTE_evaluate.sh`. The closed-loop agent
 restores the mode from `args.json`; world-model pass settings do not affect the
 baseline, whose telemetry reports zero world passes and `score_head` selection.
 
+Evaluate recorded validation inputs independently with
+`python wote_mining/WoTE_current_bev_eval.py --root-dir SPLIT_ROOT
+--checkpoint CHECKPOINT --output-dir NEW_OUTPUT_DIRECTORY`. This uses FP32,
+the deployed score argmax and the same vehicle-matrix expert poses as the
+existing WoTE evaluation. It saves pointwise L2@1/2/3/4s, ADE@2s/4s,
+FDE@4s and per-sample predicted/expert trajectories. No simulator is needed.
+
 For existing full-method checkpoints, missing planner-mode metadata means
 `future_reward`. Full training can be explicitly selected with
 `--planner-mode future_reward`.
